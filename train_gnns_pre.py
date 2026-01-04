@@ -9,12 +9,14 @@ import shutil
 from load_dataset import get_dataset, get_dataloader
 from Configures import data_args, train_args, model_args
 from pretrain import GnnClassifier
+import time
 
 
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
     # 关键：让 CuDNN 和算子都尽量确定性
@@ -125,6 +127,7 @@ def train():
     if not os.path.isdir(os.path.join('pretrain/checkpoint', data_args.dataset_name)):
         os.makedirs(os.path.join('pretrain/checkpoint', f"{data_args.dataset_name}"))
 
+    start_time = time.time()
     for epoch in range(train_args.max_epochs):
         classifier.train()
         acc = []
@@ -176,6 +179,8 @@ def train():
         if is_best or epoch % train_args.save_epoch == 0:
             save_best(pretrain_dir, epoch, classifier, model_args.model_name, eval_state['acc'], is_best)
 
+    end_time = time.time()
+    print(f"the training time is {end_time - start_time}")
     print(f"The best validation accuracy is {best_acc}.")
 
     # report test msg

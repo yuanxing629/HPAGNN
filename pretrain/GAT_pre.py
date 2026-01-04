@@ -38,8 +38,6 @@ class GATClassifier(nn.Module):
                                            dropout=model_args.gat_dropout, concat=model_args.gat_concate))
         self.gnn_non_linear = nn.ReLU()
 
-        self.bn = nn.BatchNorm1d(self.dense_dim)
-
         self.mlp = nn.Linear(self.dense_dim * len(self.readout_layers), output_dim)
         self.Softmax = nn.Softmax(dim=-1)
 
@@ -65,9 +63,7 @@ class GATClassifier(nn.Module):
             pooled.append(readout(x, batch))
         x = torch.cat(pooled, dim=1)
         graph_emb = x
-        graph_emb = self.bn(graph_emb)
 
-        graph_emb = F.dropout(graph_emb, p=0.5, training=self.training)
         logits = self.mlp(graph_emb)
         probs = self.Softmax(logits)
         return logits, probs, node_emb, graph_emb

@@ -1,18 +1,18 @@
 import torch.nn as nn
-from models.GCN import GCNNet
-from models.GAT import GATNet
+# from models.GCN import GCNNet
+# from models.GAT import GATNet
 from models.GIN import GINNet
 
 __all__ = ['GnnNets']
 
 
-def get_model(input_dim, output_dim, model_args, data_args):
-    if model_args.model_name.lower() == 'gcn':
-        return GCNNet(input_dim, output_dim, model_args, data_args)
-    elif model_args.model_name.lower() == 'gat':
-        return GATNet(input_dim, output_dim, model_args, data_args)
-    elif model_args.model_name.lower() == 'gin':
-        return GINNet(input_dim, output_dim, model_args, data_args)
+def get_model(input_dim, output_dim, model_args):
+    if model_args.model_name.lower() == 'gin':
+        return GINNet(input_dim, output_dim, model_args)
+    # elif model_args.model_name.lower() == 'gat':
+    #     return GATNet(input_dim, output_dim, model_args)
+    # elif model_args.model_name.lower() == 'gcn':
+    #     return GCNNet(input_dim, output_dim, model_args)
     else:
         raise NotImplementedError
 
@@ -42,9 +42,9 @@ class GnnBase(nn.Module):
 
 
 class GnnNets(GnnBase):
-    def __init__(self, input_dim, output_dim, model_args,data_args):
+    def __init__(self, input_dim, output_dim, model_args):
         super(GnnNets, self).__init__()
-        self.model = get_model(input_dim, output_dim, model_args,data_args)
+        self.model = get_model(input_dim, output_dim, model_args)
         self.device = model_args.device
 
     def forward(self, data):

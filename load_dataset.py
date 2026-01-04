@@ -12,6 +12,7 @@ from torch_geometric.data import Data, InMemoryDataset, download_url, extract_zi
 from torch_geometric.io import read_tu_data
 from torch_geometric.loader import DataLoader
 from numpy.random import RandomState
+from typing import *
 from typing import Optional, Callable
 import shutil
 
@@ -47,6 +48,7 @@ def get_dataset(dataset_dir, dataset_name, task=None):
     sync_dataset_dict = {
         'BA_2Motifs'.lower(): 'BA_2Motifs',
         'BA_Shapes'.lower(): 'ba_shapes',
+        'BA_MultiShapes'.lower(): 'Ba_MultiShapes',
         'Tree_Cycle'.lower(): 'Tree_Cycle',
         'Tree_Grids'.lower(): 'Tree_Grids',
     }
@@ -359,6 +361,7 @@ class BA2MotifDataset(InMemoryDataset):
             self.data, self.slices = self.collate(data_list)
 
         self.save(data_list, self.processed_paths[0])
+
 
 
 class TUDataset(InMemoryDataset):

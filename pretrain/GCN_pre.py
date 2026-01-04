@@ -4,8 +4,8 @@ import torch.nn.functional as F
 from torch_geometric.nn.conv import GCNConv
 from torch_geometric.nn.glob import global_mean_pool, global_max_pool, global_add_pool
 
-def get_readout_layers(readout):
 
+def get_readout_layers(readout):
     readout_func_dict = {
         "mean": global_mean_pool,
         "sum": global_add_pool,
@@ -36,8 +36,6 @@ class GCNClassifier(nn.Module):
                 GCNConv(self.latent_dim[i - 1], self.latent_dim[i], normalize=model_args.adj_normalize))
         self.gnn_non_linear = nn.ReLU()
 
-        self.bn = nn.BatchNorm1d(self.latent_dim[-1])
-
         self.mlp = nn.Linear(self.latent_dim[-1], output_dim)
         self.Softmax = nn.Softmax(dim=-1)
 
@@ -67,9 +65,7 @@ class GCNClassifier(nn.Module):
             pooled.append(readout(x, batch))
         x = torch.cat(pooled, dim=1)
         graph_emb = x
-        graph_emb = self.bn(graph_emb)
 
-        graph_emb = F.dropout(graph_emb, p=0.5, training=self.training)
         logits = self.mlp(graph_emb)
         probs = self.Softmax(logits)
         return logits, probs, node_emb, graph_emb

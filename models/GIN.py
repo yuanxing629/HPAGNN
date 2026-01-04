@@ -3,13 +3,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn.conv import GINConv
 from torch_geometric.data import Data, Batch
-from my_search import match_connected_subgraph
-from models.model_utils import get_readout_layers, build_subgraph_adj, GraphDecoder
+from my_search import differentiable_search_subgraph
+from models.model_utils import get_readout_layers
+from my_init import extract_connected_subgraph, extract_connected_subgraph2
+import copy
+from torch_geometric.utils import subgraph
+import networkx as nx
+import numpy as np
 
 
 # GIN
 class GINNet(nn.Module):
-    def __init__(self, input_dim, output_dim, model_args, data_args):
+    def __init__(self, input_dim, output_dim, model_args):
         super(GINNet, self).__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
@@ -44,26 +49,19 @@ class GINNet(nn.Module):
 
         self.gnn_non_linear = nn.ReLU()
 
-        self.dropout = nn.Dropout(model_args.dropout)
         self.Softmax = nn.Softmax(dim=-1)
         self.mlp_non_linear = nn.ELU()
-
-        self.bn = nn.BatchNorm1d(self.latent_dim[-1])
 
         # prototype layers
         self.epsilon = 1e-4
         self.proto_dim = self.dense_dim * len(self.readout_layers)  # graph_data embedding dim
         self.prototype_shape = (output_dim * model_args.num_prototypes_per_class, 128)
-        self.graph_size = model_args.graph_size
-        self.prototype_node_shape = (output_dim * model_args.num_prototypes_per_class, self.graph_size, 128)
+
         self.num_prototypes_per_class = model_args.num_prototypes_per_class
 
         # 先初始化为随机，后续用 initialize_prototypes_based_on_confidence来进行初始化
         # 只指定prototype_node_emb，图嵌入通过READOUT来算出
         self.num_prototypes = self.prototype_shape[0]
-        self.prototype_node_emb = nn.Parameter(torch.empty(self.num_prototypes, self.graph_size, self.proto_dim),
-                                               requires_grad=True)
-        nn.init.xavier_uniform_(self.prototype_node_emb)
 
         self.last_layer = nn.Linear(self.num_prototypes, output_dim,
                                     bias=False)  # do not use bias
@@ -76,256 +74,387 @@ class GINNet(nn.Module):
         for j in range(self.num_prototypes):
             self.prototype_class_identity[j, j // model_args.num_prototypes_per_class] = 1
 
-        self.graph_decoder = GraphDecoder(proto_dim=self.proto_dim, hidden_dim=128, edge_feat_dim=128,
-                                          num_node_classes=data_args.num_node_classes).to(self.device)
+        # used for graph_decoder
+        self.node_mlp = nn.Sequential(
+            nn.Linear(self.proto_dim, self.dense_dim, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.dense_dim, self.input_dim, bias=True),
+        )
+        # 内积解码的可学习缩放
+        self.logit_scale = nn.Parameter(torch.tensor(1.0))
 
         # 生成候选的存储
         self.generated_candidates = None  # 生成候选
+        self.max_gen_nodes = model_args.max_gen_nodes
 
         # initialize the last layer
         self.set_last_layer_incorrect_connection(incorrect_strength=-0.5)
 
+        # 原型节点嵌入用 ParameterList 存
+        self.prototype_node_emb = nn.ParameterList()  # 先空着，初始化时再填
+
+        # [新增] 存储每个原型对应的“源图”，用于后续的动态搜索
+        self.prototype_source_graphs = []  # List[Data]
+
+        # [修改] init_proto_graphs 仅用于记录最开始的状态，实际运算使用 source graphs
+        self.init_proto_graphs = None
+
+        # self.init_proto_graphs = None
+        # self.init_proto_selection_info = None
+        self.init_proto_node_list = None
+        self.init_proto_edge_list = None
+        # self.init_proto_in_which_graph = None
+        self.init_info_dict = None
+        self.anchor_graph_emb = None
+        self.init_proto_graph_emb = None
+
+        self.min_nodes = model_args.min_nodes
+        self.max_nodes = model_args.max_nodes
+
     def proto_node_emb_2_graph_emb(self):
-        if 'max' in self.readout_name:
-            proto_graph_emb = self.prototype_node_emb.max(dim=1)[0]  # [P,graph_size,128] -> [P, 128]
-        elif 'sum' in self.readout_name:
-            proto_graph_emb = self.prototype_node_emb.sum(dim=1)
-        else:
-            proto_graph_emb = self.prototype_node_emb.mean(dim=1)
+        """
+        将每个原型的节点嵌入 [N_p, d] 通过 mean/sum/max 聚合成图级嵌入 [C*m, d]。
+        注意：self.prototype_node_emb 是 ParameterList
+        """
+        proto_graph_emb_list = []
+
+        for proto_nodes in self.prototype_node_emb:  # [C*m,_,d]
+            # proto_nodes: [N_p, d]
+            if 'max' in self.readout_name:
+                g = proto_nodes.max(dim=0)[0]
+            elif 'sum' in self.readout_name:
+                g = proto_nodes.sum(dim=0)
+            else:
+                g = proto_nodes.mean(dim=0)
+            proto_graph_emb_list.append(g)
+
+        proto_graph_emb = torch.stack(proto_graph_emb_list, dim=0)  # [C*m, d]
         return proto_graph_emb
 
     # 初始化原型
+    @torch.no_grad()
     def initialize_prototypes(self, trainloader, classifier):
-        classifier.to(self.device)
+        """
+        使用预训练分类器，从训练集中为每一类选择 top-m 个高置信度整图，
+        然后从每个整图中提取紧凑连通子图作为初始化原型。
+        返回：
+          - init_proto_node_emb: List[Tensor (N_k, d)], 每个原型对应一个整图的所有节点嵌入
+          - init_proto_graph_emb: Tensor (P, d), P = C * m
+          - init_proto_graph_data: List[Data]，每个原型对应的原始图（PyG Data）
+          - info_dict: 一些计数 / 置信度信息
+        """
+        device = self.device
+        classifier.to(device)
         classifier.eval()
 
         m = self.num_prototypes_per_class
         num_classes = self.output_dim
-        # 记录每个类别的所有正确预测样本
+
+        # 每类样本： (graph_emb_full, node_emb_full, graph_data_full, conf_full)
         correct_predictions = {c: [] for c in range(num_classes)}
         all_samples = {c: [] for c in range(num_classes)}
-        global_idx = 0
 
-        with torch.no_grad():
-            for batch in trainloader:
-                batch = batch.to(self.device)
-                logits, probs, node_emb, graph_emb = classifier(batch)
+        for batch in trainloader:
+            batch = batch.to(device)
+            logits, probs, node_emb, graph_emb = classifier(batch)
 
-                # graph_emb 应为 [batch_size, embed_size]
-                if graph_emb is None:
-                    raise RuntimeError("Graph embedding is None")
+            # graph_emb: [B, d], node_emb: [total_nodes_in_batch, d]
+            data_list = batch.to_data_list()
 
-                # 因为 batch 是合并的 Data (Batch)，使用 to_data_list() 获取原始 Data 列表
-                data_list = batch.to_data_list()
-                probs_cpu = probs.detach().cpu()
-                node_emb_cpu = node_emb.detach().cpu()
-                graph_emb_cpu = graph_emb.detach().cpu()
+            probs_cpu = probs.detach().cpu()
+            node_emb_cpu = node_emb.detach().cpu()
+            graph_emb_cpu = graph_emb.detach().cpu()
+            batch_cpu = batch.batch.detach().cpu()
 
-                for i in range(graph_emb_cpu.size(0)):
-                    y_true = int(batch.y[i].item())  # 第i个图的真实标签，例如0
-                    pred = int(probs_cpu[i].argmax().item())  # 第i个图的预测结果，例如0
-                    conf = float(probs_cpu[i][y_true].item())  # 第i个图的置信度得分，即被正确分类的概率，例如0.996
+            for i, data_i in enumerate(data_list):
+                y_true = int(batch.y[i].item())
+                pred = int(probs_cpu[i].argmax().item())
+                conf = float(probs_cpu[i][y_true].item())
 
-                    # 获取第i个图对应的图数据
-                    graph_data = data_list[i].clone().to('cpu')  # 确保图数据在CPU上
+                # 当前图的节点 mask
+                batch_mask = (batch_cpu == i)
+                current_node_emb = node_emb_cpu[batch_mask]  # [N_i, d]
+                current_graph_emb = graph_emb_cpu[i]  # [d]
 
-                    # 获取第i个图的节点嵌入
-                    # 注意：node_emb_cpu 包含整个batch的节点嵌入，需要根据batch划分提取当前图的节点嵌入
-                    batch_mask = (batch.batch == i)  # 创建当前图的掩码
-                    current_node_emb = node_emb_cpu[batch_mask.cpu()]  # 提取当前图的节点嵌入
+                # 必须 Clone Data，否则后续会被覆盖
+                graph_data_i = data_i.clone()  # CPU Data
 
-                    # (embedding, graph_data, node_emb, global_idx, confidence) 五元组
-                    all_samples[y_true].append(
-                        (graph_emb_cpu[i].clone(), graph_data, current_node_emb, global_idx, conf))
-                    # 只存储预测正确的样本:
-                    if pred == y_true:
-                        correct_predictions[y_true].append(
-                            (graph_emb_cpu[i].clone(), graph_data, current_node_emb, global_idx, conf))
-                    global_idx = global_idx + 1
+                tup = (
+                    current_graph_emb.clone(),  # graph_emb
+                    current_node_emb.clone(),  # node_emb
+                    graph_data_i,  # graph_data
+                    conf
+                )
+                all_samples[y_true].append(tup)
+                if pred == y_true:
+                    correct_predictions[y_true].append(tup)
 
-        # 现在对每个类做选择，若类 c 的正确预测样本长度 L >= m ，则从中取 m 个最高的；否则全取并从 all_samples 填充
-        selected_embeddings = []  # 原型嵌入列表
-        selected_graphs = []  # 对应的图数据列表
-        selected_node_embeddings = []  # 对应的节点嵌入列表
-        selection_info = []  # 选择信息，用于调试
-
-        info_dict = {
-            'correct_predictions_counts': {c: len(correct_predictions[c]) for c in range(num_classes)},
-            'total_samples_counts': {c: len(all_samples[c]) for c in range(num_classes)},
-            'final_selection': {c: 0 for c in range(num_classes)},
-            'selected_confidences': {c: [] for c in range(num_classes)}
-        }
+        selected_full_graphs = []
+        info_dict = {'final_selection': {c: 0 for c in range(num_classes)}}
 
         for c in range(num_classes):
             pool = correct_predictions[c]
-            L = len(pool)
-            chosen_embeddings = []
-            chosen_graphs = []
-            chosen_node_embeddings = []
-            chosen_info = []
-            chosen_confidences = []
+            if len(pool) == 0:
+                # 如果这一类一个预测正确的都没有，就退化到 all_samples
+                pool = all_samples[c]
 
-            if L >= m:
-                # 按置信度从高到低排序，选择前m个
-                pool_sorted = sorted(pool, key=lambda x: x[4], reverse=True)  # 按置信度降序排序
-                selected = pool_sorted[:m]
-                chosen_embeddings = [item[0] for item in selected]
-                chosen_graphs = [item[1] for item in selected]
-                chosen_node_embeddings = [item[2] for item in selected]  # 提取节点嵌入
-                chosen_confidences = [item[4] for item in selected]  # 置信度
-                chosen_info = [f"class_{c}_high_conf_idx_{item[3]}_conf_{item[4]:.4f}" for item in selected]
-                info_dict['final_selection'][c] = m
-            else:
-                # 如果正确预测样本不足 m 个，则使用所有正确预测样本
-                pool_sorted = sorted(pool, key=lambda x: x[4], reverse=True)
-                chosen_embeddings = [item[0] for item in pool_sorted]
-                chosen_graphs = [item[1] for item in pool_sorted]
-                chosen_node_embeddings = [item[2] for item in pool_sorted]  # 提取节点嵌入
-                chosen_confidences = [item[4] for item in pool_sorted]  # 置信度
-                chosen_info = [f"class_{c}_high_conf_idx_{item[3]}_conf_{item[4]:.4f}" for item in pool_sorted]
+            # 按置信度从高到低排序
+            pool_sorted = sorted(pool, key=lambda x: x[3], reverse=True)
 
-                # 如果仍然不足，重复使用最高置信度的样本
-                need = m - len(pool)
-                # 重复使用置信度最高的样本
-                highest_conf_sample = pool_sorted[0] if pool_sorted else None
+            chosen = []
+            while len(chosen) < m:
+                need = m - len(chosen)
+                if len(pool_sorted) == 0:
+                    break
+                if len(pool_sorted) >= need:
+                    chosen.extend(pool_sorted[:need])
+                else:
+                    chosen.extend(pool_sorted)  # 重复采样
+            chosen = chosen[:m]
 
-                for _ in range(need):
-                    if highest_conf_sample:
-                        chosen_embeddings.append(highest_conf_sample[0].clone())
-                        chosen_graphs.append(highest_conf_sample[1])
-                        chosen_node_embeddings.append(highest_conf_sample[2])
-                        chosen_confidences.append(highest_conf_sample[4])
-                        chosen_info.append(
-                            f"class_{c}_repeated_idx_{highest_conf_sample[3]}_conf_{highest_conf_sample[4]:.4f}")
+            info_dict['final_selection'][c] = len(chosen)
+            selected_full_graphs.extend([(c, item) for item in chosen])
 
-            selected_embeddings.extend(chosen_embeddings[:m])  # (C*m, 128)
-            selected_graphs.extend(chosen_graphs[:m])
-            selected_node_embeddings.extend(chosen_node_embeddings[:m])  # (C*m, N_i, 128)
-            selection_info.extend(chosen_info[:m])
-            info_dict['selected_confidences'][c] = chosen_confidences[:m]
-
-        # 用选出的 C*m 个图的节点嵌入+图嵌入来初始化可学习的 proto_node_emb
-        # prototype_node_emb 形状: [num_prototypes, graph_size, proto_dim]
-        P, G, d = self.prototype_node_shape  # P=C*m, G=self.graph_size, d=self.protodim
-        if len(selected_embeddings) < P:
-            print(f"Warning: only {len(selected_embeddings)} candidate graphs for {P} prototypes, "
-                  f"will repeat some high-confidence samples.")
-            # 简单粗暴：循环填满
-            while len(selected_embeddings) < P:
-                selected_embeddings.append(selected_embeddings[-1].clone())
-                selected_node_embeddings.append(selected_node_embeddings[-1].clone())
-                selected_graphs.append(selected_graphs[-1])
-        # assert len(selected_embeddings) == P, \
-        #     f"selected_embeddings 数量 {len(selected_embeddings)} 与 num_prototypes {P} 不一致"
-
+        # ---------- 对每个整图提连通子图，并重算 emb ----------
+        init_proto_node_emb = []
+        init_proto_graph_emb_list = []
         init_proto_node_list = []
         init_proto_edge_list = []
-        for k in range(P):  # 第k个原型
-            # 第k个代表性图(全图)的图嵌入 & 节点嵌入
-            graph_emb_k = selected_embeddings[k].to(self.device)  # [d]
-            node_emb_k = selected_node_embeddings[k].to(self.device)  # [N_k, d]
-            nk = node_emb_k.size(0)  # 该图的节点数 N_k
+        init_proto_in_which_graph = []
 
-            # 1) 计算节点重要性：与图嵌入的余弦相似度
-            g_norm = F.normalize(graph_emb_k, dim=0)  # [d]
-            nodes_norm = F.normalize(node_emb_k, dim=1)  # [N_k, d]
-            scores = torch.mv(nodes_norm, g_norm)  # [N_k]
+        # [新增] 存储源图
+        self.prototype_source_graphs = []
+        init_subgraphs = []  # [新增] 用于存储子图，对应 prototype embedding 的结构
 
-            # 2) 按重要性排序，取前 min(N_k, graph_size) 个节点(降序)
-            idx_sorted = torch.argsort(scores, descending=True)  # [N_k]
-            used = min(nk, self.graph_size)
+        for c, item in selected_full_graphs:
+            g_emb_full, n_emb_full, g_data_full, conf_full = item
 
-            # === 新增：构造该图的邻接关系（基于 selected_graphs[k]） ===
-            graph_data_k = selected_graphs[k]  # 这是原始的 Data（在 CPU 上）
-            edge_index = graph_data_k.edge_index  # [2, E]
-            # 假设是无向图（BA_2Motif/很多分子图都是无向的），我们用双向邻居
-            row, col = edge_index
-            adj = [[] for _ in range(graph_data_k.num_nodes)]
-            for u, v in zip(row.tolist(), col.tolist()):
-                adj[u].append(v)
-                adj[v].append(u)
+            # [重要] 保存源图，供后续 Search 使用
+            self.prototype_source_graphs.append(g_data_full)
 
-            # === 新增：在保证连通性的前提下，选出 used 个节点 ===
-            scores_cpu = scores.detach().cpu()
+            # 临时启用梯度计算
+            # 初始子图提取（Gradient-based)
+            with torch.enable_grad():
+                sub_data, sub_info = extract_connected_subgraph2(
+                    g_data_full,
+                    classifier,
+                    target_class=c,
+                    min_nodes=self.min_nodes,
+                    max_nodes=self.max_nodes,
+                    return_info=True,
+                )
 
-            # 选一个分数最高的节点作为种子
-            seed = idx_sorted[0].item()
-            selected_nodes = {seed}
-            # frontier：当前选中子图的“边界邻居”
-            frontier = set(adj[seed])
+            # [关键修正] 保存子图结构，供 Generate 阶段计算 A_init 使用
+            # sub_data 的 edge_index 已经是 relabel 过的 [0, N_sub-1]
+            init_subgraphs.append(sub_data.detach().cpu())
 
-            # 如果 graph_size 比较小、图是连通的，这个循环基本能在同一连通块里填满
-            while len(selected_nodes) < used:
-                if not frontier:
-                    # 理论上这只会在图不连通、或者连通块太小的时候发生
-                    # 你可以：
-                    #   1) 允许子图小于 graph_size（保证连通性优先）
-                    #   2) 或者从分数最高且未选的节点里再开一个种子（会引入第二个连通块）
-                    # 下面给的是“兼顾 size 的版本”：允许极少数情况出现多连通块
-                    for cand in idx_sorted.tolist():
-                        if cand not in selected_nodes:
-                            selected_nodes.add(cand)
-                            frontier.update(adj[cand])
-                            break
-                    if len(selected_nodes) >= used:
-                        break
+            node_idx = sub_data.orig_node_idx.cpu()  # 原图中的节点编号 (N_sub,)
+            edge_index_sub = sub_data.edge_index.cpu()  # 子图内部编号 (2, E)
+            orig_edge_index = node_idx[edge_index_sub]  # (2, E), 原图编号
 
-                # 在 frontier 中选得分最高的节点加入子图
-                best_nb = max(frontier, key=lambda u: scores_cpu[u].item())
-                frontier.remove(best_nb)
-                if best_nb in selected_nodes:
-                    continue
-                selected_nodes.add(best_nb)
-                # frontier 加上新点的邻居
-                for nb in adj[best_nb]:
-                    if nb not in selected_nodes:
-                        frontier.add(nb)
+            init_proto_node_list.append(node_idx)
+            init_proto_edge_list.append(orig_edge_index.t().tolist())
 
-            # 最终的节点索引（Tensor）
-            selected_idx = torch.tensor(sorted(list(selected_nodes)), dtype=torch.long)
+            # 在子图上重算 embedding
+            sub_data_gpu = sub_data.clone().to(device)
+            if not hasattr(sub_data_gpu, "batch") or sub_data_gpu.batch is None:
+                sub_data_gpu.batch = torch.zeros(sub_data_gpu.num_nodes, dtype=torch.long, device=device)
 
-            # 3) 先用均值 + 小噪声填满整块 [graph_size, d]
-            mean_node = node_emb_k.mean(dim=0, keepdim=True)  # [1, d]
-            proto_block = mean_node + 1e-2 * torch.randn(self.graph_size, d, device=self.device)
+            _, sub_probs, sub_node_emb, sub_graph_emb = classifier(sub_data_gpu)
 
-            # 4) 用“连通且高分”的节点替换前 len(selected_idx) 个位置
-            used = min(self.graph_size, selected_idx.size(0))
-            proto_block[:used] = node_emb_k[selected_idx[:used]]
-            # 这样使得，若N_k >= graph_size，得到了排名前graph_size的节点嵌入
-            # 若N_k < graph_size, 取到了N_k个节点嵌入和均值+噪声
+            init_proto_node_emb.append(sub_node_emb.detach().cpu())
+            init_proto_graph_emb_list.append(sub_graph_emb.squeeze(0).detach().cpu())  # [d]
+            # 这里依然保存全图，用于 visualize_init_prototypes 能够画出全图背景
+            init_proto_in_which_graph.append(g_data_full)
 
-            # 记录该原型对应的子图节点和边（保持原图索引）
-            # 这些节点的索引相对于 selected_graphs[k] 那个原图（Data）的节点顺序
-            node_idx = selected_idx[:used].cpu()  # 原图中的节点索引，长度 = used
+        # ---------- 堆叠 / 搬到 device ----------
+        init_proto_graph_emb = torch.stack(init_proto_graph_emb_list, dim=0).to(device)
+        init_proto_node_emb = [t.to(device) for t in init_proto_node_emb]
 
-            graph_data_k = selected_graphs[k]  # 原始图 Data，在 CPU 上
-            edge_index = graph_data_k.edge_index  # [2, E]，使用的是原图的节点编号
-            num_nodes = graph_data_k.num_nodes
+        # ---------- 注册成可学习参数 ----------
+        self.prototype_node_emb = nn.ParameterList([
+            nn.Parameter(t.clone().detach(), requires_grad=True)
+            for t in init_proto_node_emb
+        ])
 
-            # 节点掩码：标记原图中哪些节点属于这个子图
-            node_mask = torch.zeros(num_nodes, dtype=torch.bool)
-            node_mask[node_idx] = True
+        # [修改] 使用 anchor_graph_emb 作为动态目标，而不是固定的 init
+        if hasattr(self, "anchor_graph_emb"):
+            self.anchor_graph_emb = init_proto_graph_emb.clone().detach()
+        else:
+            self.register_buffer("anchor_graph_emb", init_proto_graph_emb.clone().detach())
 
-            # 只保留两端都在子图节点集合内的边（仍然使用原图的节点编号）
-            edge_mask = node_mask[edge_index[0]] & node_mask[edge_index[1]]
-            sub_edge_index = edge_index[:, edge_mask].clone()  # [2, E_sub]，仍然是原图索引
+        if hasattr(self, "init_proto_graph_emb"):
+            self.init_proto_graph_emb = init_proto_graph_emb.clone().detach()
+        else:
+            self.register_buffer("init_proto_graph_emb", init_proto_graph_emb.clone().detach())
 
-            # 记录：
-            # - node_idx: 该原型子图在原图中的节点索引
-            # - sub_edge_index: 该子图在原图中的边(端点也是原图节点编号)
-            init_proto_node_list.append(node_idx)  # List[Tensor(num_nodes_sub)]
-            edges_for_vis = sub_edge_index.t().tolist()  # 形状 [E_sub, 2] -> List[List[int]]
-            init_proto_edge_list.append(edges_for_vis)
+        # [关键修正] init_proto_graphs 必须存子图，否则 generate 阶段 A_init 索引越界
+        self.init_proto_graphs = init_subgraphs
 
-            # 5) 写入到可学习原型参数中
-            self.prototype_node_emb[k].data.copy_(proto_block)
+        self.init_proto_node_list = init_proto_node_list
+        self.init_proto_edge_list = init_proto_edge_list
+        self.init_info_dict = info_dict
 
-        init_proto_node_emb = self.prototype_node_emb.detach().clone()
-        init_proto_graph_emb = self.proto_node_emb_2_graph_emb().detach().clone()
-        init_proto_in_which_graph = selected_graphs
-
-        # [C*m,graph_size,d]  [C*m,d]  [num_nodes_sub_k]  [2, E_sub_k]  [C*m] info
         return init_proto_node_emb, init_proto_graph_emb, init_proto_node_list, init_proto_edge_list, init_proto_in_which_graph, info_dict
+
+    #  动态锚点更新函数
+    @torch.no_grad()
+    def update_prototype_anchors(self, momentum=0.6):
+        """
+        混合机制的核心：使用可微掩码优化 (Differentiable Mask Optimization) 更新 anchor
+        """
+        was_training = self.training
+        self.eval()
+
+        # 当前学习到的原型图向量
+        current_proto_graph_embs = self.proto_node_emb_2_graph_emb()  # [P, d]
+
+        new_anchor_embs = []
+
+        # 遍历每个原型
+        for i in range(self.num_prototypes):
+            # 1. 获取目标向量
+            target_vec = current_proto_graph_embs[i]  # [d]
+
+            # 2. 获取源图
+            source_graph = self.prototype_source_graphs[i].to(self.device)
+            if not hasattr(source_graph, "batch") or source_graph.batch is None:
+                source_graph.batch = torch.zeros(source_graph.num_nodes, dtype=torch.long, device=self.device)
+
+            best_nodes, best_sim = differentiable_search_subgraph(
+                proto_graph_emb=target_vec,
+                source_data=source_graph,  # 直接传 data，因为需要 x 和 edge_index
+                model=self,
+                min_nodes=self.min_nodes,
+                max_nodes=self.max_nodes,
+                iterations=50,  # 迭代次数，50次通常足够收敛
+                lr=0.05,  # 学习率
+                l1_reg=0.05,  # 稀疏正则权重，可根据效果微调
+                lambda_entropy=0.1  # 熵正则权重
+            )
+
+            if best_nodes is not None and len(best_nodes) > 0:
+                node_idx = torch.tensor(sorted(list(best_nodes)), dtype=torch.long, device=self.device)
+
+                # 再次 forward 最终确定的子图以获取 Embedding
+                sub_edge_index, _ = subgraph(node_idx, source_graph.edge_index, relabel_nodes=True)
+
+                sub_data = Data(x=source_graph.x[node_idx], edge_index=sub_edge_index)
+                sub_data.batch = torch.zeros(sub_data.num_nodes, dtype=torch.long, device=self.device)
+
+                _, _, _, sub_graph_emb, _ = self.forward(sub_data)
+                new_anchor_embs.append(sub_graph_emb.detach())
+            else:
+                # 兜底：如果优化失败，保持旧 anchor
+                new_anchor_embs.append(self.anchor_graph_emb[i].unsqueeze(0))
+
+        new_anchors_tensor = torch.cat(new_anchor_embs, dim=0).detach()
+        # 如果是第一次更新（或 anchor 还没初始化好），直接赋值
+        # 否则：Old * momentum + New * (1 - momentum)
+        if not hasattr(self, "anchor_graph_emb"):
+            self.register_buffer("anchor_graph_emb", new_anchors_tensor)
+        else:
+            self.anchor_graph_emb = momentum * self.anchor_graph_emb + (1 - momentum) * new_anchors_tensor
+
+        if was_training:
+            self.train()
+
+    @torch.no_grad()
+    def refresh_and_update_anchors(self, trainloader, top_k_ratio=0.2):
+        """
+        动态源图更新与锚点投影：
+        1. 遍历 trainloader，计算当前模型对所有样本的置信度。
+        2. 对每个类别，筛选出预测正确且置信度最高的 Top-K% 样本（至少 m 个）。
+        3. 更新 self.prototype_source_graphs 为这些新的高质量样本。
+        4. 在这些新源图上执行 Beam Search，更新 anchor_graph_emb。
+        """
+        was_training = self.training
+        self.eval()
+        device = self.device
+
+        m = self.num_prototypes_per_class
+        num_classes = self.output_dim
+
+        # 1. 收集所有样本的置信度信息
+        # 结构: {class_idx: [(graph_data, confidence), ...]}
+        candidates = {c: [] for c in range(num_classes)}
+
+        # 为了避免占用过多显存，我们在循环中处理，并把 data 移回 CPU 暂存
+        for batch in trainloader:
+            batch = batch.to(device)
+            # 使用当前模型进行预测
+            # _, probs, _, _ = classifier_forward_pass(self, batch) # 辅助函数或直接 forward
+            # # 这里直接调用 forward 即可，只需要 probs
+            _, probs, _, _, _ = self.forward(batch)
+
+            probs_cpu = probs.detach().cpu()
+            data_list = batch.to_data_list()
+
+            for i, data in enumerate(data_list):
+                y_true = int(data.y.item())
+                pred_cls = int(probs_cpu[i].argmax().item())
+                conf = float(probs_cpu[i][y_true].item())
+
+                # 只保留预测正确的样本
+                if pred_cls == y_true:
+                    # 将 data 移回 CPU 以节省显存，clone 以防被后续操作修改
+                    data_cpu = data.clone().cpu()
+                    candidates[y_true].append((data_cpu, conf))
+
+        # 2. 筛选 Top-K% 并更新源图池
+        new_source_graphs = []  # 扁平化列表，长度应为 num_classes * m
+        # 我们需要保持原型索引的顺序：Class 0 (0..m-1), Class 1 (m..2m-1)...
+
+        # 临时的列表，用于按顺序存放每个原型的源图
+        ordered_source_graphs = [None] * (num_classes * m)
+
+        for c in range(num_classes):
+            pool = candidates[c]
+            # 按置信度降序排列
+            pool.sort(key=lambda x: x[1], reverse=True)
+
+            total_correct = len(pool)
+            if total_correct == 0:
+                # 极端情况：该类没有预测正确的样本。
+                # 策略：保留旧的源图，或者从所有样本中选（这里暂且跳过更新，保留旧的）
+                print(f"Warning: Class {c} has no correct predictions. Keeping old source graphs.")
+                # 填回旧的源图
+                start_idx = c * m
+                for k in range(m):
+                    ordered_source_graphs[start_idx + k] = self.prototype_source_graphs[start_idx + k]
+                continue
+
+            # 计算截断阈值
+            cutoff_num = int(total_correct * top_k_ratio)
+            # 保证至少取 m 个（如果总数够的话）
+            num_to_select = max(cutoff_num, m)
+            # 如果总数连 m 个都不够，就取全部
+            num_to_select = min(num_to_select, total_correct)
+
+            # Top Pool
+            top_pool = pool[:num_to_select]
+
+            # 3. 为该类别的 m 个原型分配源图
+            # 策略：从 Top Pool 中轮询分配，或者是随机采样分配，保证多样性
+            # 这里采用简单轮询：确保最好的图被用到
+            for k in range(m):
+                # 循环取样，确保填满 m 个
+                sample_idx = k % len(top_pool)
+                source_data = top_pool[sample_idx][0]  # 取出 Data 对象
+
+                global_proto_idx = c * m + k
+                ordered_source_graphs[global_proto_idx] = source_data
+
+        # 更新成员变量
+        self.prototype_source_graphs = ordered_source_graphs
+        # print(f"Source graphs refreshed using Top-{top_k_ratio*100}% high confidence samples.")
+
+        # 4. 立即基于新源图执行 Beam Search 更新锚点
+        # 复用已有的 update_prototype_anchors 函数
+        self.update_prototype_anchors(momentum=0.5)
+
+        if was_training:
+            self.train()
 
     def set_last_layer_incorrect_connection(self, incorrect_strength):
         """
@@ -362,201 +491,403 @@ class GINNet(nn.Module):
             pooled.append(readout(x, batch))
         x = torch.cat(pooled, dim=-1)
         graph_emb = x
-        graph_emb = self.bn(graph_emb)
-
-        graph_emb = F.dropout(graph_emb, p=0.5, training=self.training)
 
         similarity, min_distances = self.prototype_distances(x)
         logits = self.last_layer(similarity)
         probs = self.Softmax(logits)
         return logits, probs, node_emb, graph_emb, min_distances
 
-    # 生成候选原型
-    def generate_candidate_prototypes(self):
+    @torch.no_grad()
+    def search_prototype_subgraphs(self, trainloader, min_nodes: int, max_nodes: int):
         """
-        生成候选原型 - 核心生成函数
-        为每个原型生成多个候选图，然后提取它们的嵌入作为候选原型
-        """
+        对当前模型学到的每个原型， 在训练集的真实图上搜索与其图级嵌入最相似的真实子图
+        (min_nodes <= 子图节点数 <= max_nodes)。
 
+        返回：
+          best_node_list: List[P]，best_node_list[p] 是 Tensor[ num_nodes_sub_p ]
+                          表示该原型对应子图在那张图里的节点编号（相对那张 Data，从 0 开始）
+          best_edge_list: List[P]，best_edge_list[p] 是 LongTensor[2, E_sub_p]，子图的边列表
+          best_sim_list:  List[P]，best_sim_list[p] 是 float，相似度
+          best_graph_idx_list
+        """
+        # 保持不变，用于最终可视化
+        device = self.device
+        self.eval()
+
+        # 当前原型的图级嵌入 [P, d]
+        proto_graph_emb = self.proto_node_emb_2_graph_emb()  # 你已有的函数
+        num_prototypes = proto_graph_emb.size(0)
+
+        # 初始化最优解
+        best_node_list = [None for _ in range(num_prototypes)]
+        best_edge_list = [None for _ in range(num_prototypes)]
+        best_sim_list = [float("-inf") for _ in range(num_prototypes)]
+        best_graph_idx_list = [None for _ in range(num_prototypes)]
+        global_graph_idx = 0
+
+        for batch in trainloader:
+            batch = batch.to(device)
+            logits, probs, node_emb, graph_emb, _ = self.forward(batch)
+
+            data_list = batch.to_data_list()
+            # node_emb: [sum_i N_i, d]，data_list 里每个 Data 的节点是 0..N_i-1
+            cursor = 0
+            for data in data_list:
+                N = data.num_nodes
+                node_emb_g = node_emb[cursor:cursor + N]  # [N, d]
+                cursor += N
+
+                edge_index_g = data.edge_index.to(device)  # [2, E]，节点编号 0..N-1
+                x_g = data.x.to(device)
+
+                # 对每个原型，在这张图上跑一次搜索
+                for p_idx in range(num_prototypes):
+                    proto_emb_p = proto_graph_emb[p_idx]  # [d]
+
+                    temp_data = Data(x=data.x.to(device), edge_index=data.edge_index.to(device))
+                    temp_data.batch = torch.zeros(temp_data.num_nodes, dtype=torch.long, device=device)
+
+                    sub_nodes, sub_sim = differentiable_search_subgraph(
+                        proto_graph_emb=proto_emb_p,
+                        source_data=temp_data,
+                        model=self,
+                        min_nodes=min_nodes,
+                        max_nodes=max_nodes,
+                        iterations=100,  # 推理阶段可以用更多迭代
+                        lr=0.05
+                    )
+                    if sub_nodes is None:
+                        continue
+
+                    if sub_sim > best_sim_list[p_idx]:
+                        best_sim_list[p_idx] = sub_sim
+                        # sub_nodes 是 set[int]，转 Tensor 并排序一下
+                        node_idx = torch.tensor(sorted(list(sub_nodes)), dtype=torch.long)
+
+                        # 构造子图边：选两端都在 node_idx 的边
+                        node_mask = torch.zeros(N, dtype=torch.bool, device=device)
+                        node_mask[node_idx] = True
+                        mask_edge = node_mask[edge_index_g[0]] & node_mask[edge_index_g[1]]
+                        sub_edge_index = edge_index_g[:, mask_edge].detach().cpu()  # 保留原图节点编号
+
+                        best_node_list[p_idx] = node_idx.detach().cpu()
+                        best_edge_list[p_idx] = sub_edge_index
+                        best_graph_idx_list[p_idx] = global_graph_idx
+                global_graph_idx += 1
+
+        return best_node_list, best_edge_list, best_sim_list, best_graph_idx_list
+
+    @staticmethod
+    def _sym_clean(A, symmetric=True, remove_self_loops=True):
+        if symmetric:
+            A = 0.5 * (A + A.transpose(-1, -2))
+        if remove_self_loops:
+            idx = torch.arange(A.size(-1), device=A.device)
+            A[..., idx, idx] = 0.0
+        return A
+
+    def graph_decoder(self, prototype_node_emb):
+        # 若输入 [N, d] -> [1, N, d]
+        if prototype_node_emb.dim() == 2:
+            prototype_node_emb = prototype_node_emb.unsqueeze(0)
+        H = prototype_node_emb
+        B, N, _ = H.shape
+
+        # 两层 MLP 生成节点属性（重构 X）
+        node_feats = self.node_mlp(H)
+
+        # 内积解码得到边 logits / 概率
+        edge_logits = torch.bmm(node_feats, node_feats.transpose(1, 2)) * self.logit_scale  # [B, N, N]
+        edge_probs = torch.sigmoid(edge_logits)
+
+        # 对称并去自环
+        adj_soft = self._sym_clean(edge_probs)
+
+        return {
+            "node_feats": node_feats,  # 用于节点属性重构 + 生成
+            "edge_logits": edge_logits,
+            "edge_probs": edge_probs,
+            "adj_soft": adj_soft,
+        }
+
+    def _largest_connected_component(self, adj_hard: torch.Tensor):
+        """
+        adj_hard: [N, N] in {0,1}
+        返回 largest_cc_nodes: List[int] 以及子图边列表 List[(u,v)]
+        """
+        N = adj_hard.size(0)
+        # 无边的情况
+        if adj_hard.sum() == 0:
+            nodes = list(range(N))
+            edges = []
+            return nodes, edges
+
+        visited = [False] * N
+        comps = []
+
+        for v in range(N):
+            if not visited[v]:
+                stack = [v]
+                comp = []
+                visited[v] = True
+                while stack:
+                    u = stack.pop()
+                    comp.append(u)
+                    neighbors = (adj_hard[u] > 0).nonzero(as_tuple=False).view(-1).tolist()
+                    for w in neighbors:
+                        if not visited[w]:
+                            visited[w] = True
+                            stack.append(w)
+                comps.append(comp)
+
+        # 取最大连通分量
+        comps.sort(key=len, reverse=True)
+        largest_cc = comps[0]
+        largest_cc_set = set(largest_cc)
+
+        # 生成边列表
+        edges = []
+        for i in largest_cc:
+            for j in range(i + 1, N):
+                if j in largest_cc_set and adj_hard[i, j] > 0:
+                    edges.append((i, j))
+
+        return largest_cc, edges
+
+    # 在训练后生成原型图+可视化
+    def generate_candidate_prototypes(self, threshold: float = 0.9):
+        """
+        [策略升级] 基于锚点的生成式细化 (Anchor-based Generative Refinement)
+        不再凭空生成，而是利用 Search Branch 找到的源图作为骨架，
+        生成分支学习一个 Attention/Mask 来“提纯”这个骨架。
+        """
+        device = self.device
         candidate_embeddings = []
-        candidate_adj_hard = []
-        candidate_adj_soft = []
         candidate_node_features = []
-        candidate_node_types = []
-        candidate_edge_logits = []  # 存储edge_logits
-        candidate_edge_probs = []  # 存储edge_probs
-        candidate_graph_data = []  # 存储图数据对象
-        candidate_node_lists = []  # 存储节点列表
+        candidate_graph_data = []
+
+        was_training = self.training
+        self.eval()
 
         with torch.no_grad():
-            # 为每个原型生成候选
-            for i, node_emb in enumerate(self.prototype_node_emb):
-                # node_emb: [self.graph_size, 128], 一共num_classes * num_prototype_per_class 个
-                # node_emb = node_emb.to(self.device)
+            for p_idx in range(self.num_prototypes):
+                # 1. 获取对应的源图 (来自 Search Branch 的成果)
+                # 注意：self.prototype_source_graphs 是 Data 对象列表
+                source_data = self.prototype_source_graphs[p_idx].to(device)
 
-                # 使用解码器生成图结构，同时获取图嵌入
-                decoder_out = self.graph_decoder(node_emb, tau=None, hard=True, readout_layers=self.readout_layers)
-                # # 训练期：软邻接 + 节点类型 logits
-                # out = decoder(proto, tau=1.0, hard=False)  # 用 Gumbel 训练更平滑
-                # node_logits = out["node_logits"]  # 监督 CrossEntropy
-                # adj_soft = out["adj_soft"]  # 监督 BCE/负采样
-                # graph_emb = out["graph_emb"]  # 可与类别原型/标签对齐
-                #
-                # # 推理期：离散邻接 + 节点类型
-                # out_inf = decoder(proto, tau=None, hard=True)
-                # node_type = out_inf["node_type_ids"]  # [N]
-                # A_bin = out_inf["adj_hard"]  # [N,N]
-                # g_emb = out_inf["graph_emb"]  # [F]
+                # 2. 获取当前原型的 Embedding
+                proto_vec = self.prototype_node_emb[p_idx]  # [N_k, d] (这是以前的可学习参数)
+                # 或者使用图级嵌入
+                # proto_vec = self.proto_node_emb_2_graph_emb()[p_idx] # [d]
 
-                node_features = decoder_out['node_feats']
-                node_type_ids = decoder_out['node_type_ids']
-                edge_logits = decoder_out['edge_logits']
-                edge_probs = decoder_out['edge_probs']
-                adj_soft = decoder_out['adj_soft']
-                adj_hard = decoder_out['adj_hard']
-                graph_emb = decoder_out['graph_emb']
+                # 3. 这里的关键逻辑：
+                # 我们不再用 proto_vec 解码出 N*N 矩阵。
+                # 而是计算 proto_vec 与 source_data 节点的"相关性"，作为保留边的依据。
 
-                single_adj_soft = adj_soft[0]
-                if adj_hard is None:
-                    # 如果意外没有硬邻接，就用 soft > 0.5 二值化一个
-                    single_adj_hard = (single_adj_soft > 0.5).float()
-                else:
-                    single_adj_hard = adj_hard[0]
-                single_node_features = node_features[0]
-                single_node_types = node_type_ids[0]
+                # 获取源图的节点特征
+                #  【新增修正】先通过 GNN 提取节点嵌入
+                # 不能直接用 source_data.x，因为维度不对
+                x_src, edge_index_src = source_data.x, source_data.edge_index
+                # 临时通过 GNN 层 (不经过最后一层分类器)
+                for i in range(self.num_gnn_layers):
+                    x_src = self.gnn_layers[i](x_src, edge_index_src)
+                    if self.emb_normalize:
+                        x_src = F.normalize(x_src, p=2, dim=-1)
+                    x_src = self.gnn_non_linear(x_src)
 
-                # 创建图数据对象
-                graph_data, node_list = self._create_graph_data_from_generated(
-                    single_node_features, single_adj_hard, single_node_types, prototype_idx=i
+                # 此时 x_src 是 [N_src, 128]，可以喂给 decoder 了
+                node_emb_src = x_src
+
+                # 如果 Search Branch 已经找到过一个最优子图索引，我们应该基于那个子图做细化
+                # 如果没有记录，就基于全图做 (这里假设基于全图，或者你可以存下 best_node_list)
+
+                # 计算节点重要性分数 (Refinement Score)
+                # 简单做法：计算源图节点与原型嵌入的相似度
+                # 假设 proto_vec 是图级嵌入 [d]
+                # scores = torch.matmul(x_src, proto_vec.unsqueeze(1)).squeeze() # [N_src]
+                # scores = torch.sigmoid(scores)
+
+                # 高级做法 (使用你现有的 decoder MLP):
+                # 我们把源图的节点特征视为 p_i，输入 node_mlp 得到重构特征
+                # 然后计算边概率，但只保留 edge_index 中存在的边！
+
+                # 使用源图特征进行解码
+                decoder_out = self.graph_decoder(node_emb_src)
+                edge_probs_full = decoder_out["edge_probs"][0]  # [N_src, N_src] 全连接概率
+
+                # 4. [核心创新] 结构掩码 (Structural Masking)
+                # 只保留源图真实存在的边！
+                # 这样生成的图，结构必然是源图的子集，绝对不可能是完全图。
+
+                # 构建源图的邻接矩阵 Mask
+                src_adj_mask = torch.zeros_like(edge_probs_full)
+                src_adj_mask[edge_index_src[0], edge_index_src[1]] = 1.0
+
+                # 融合：Refined Adjacency = Generator Probability * Structural Prior
+                refined_adj = edge_probs_full * src_adj_mask
+
+                # 5. 阈值截断与清理
+                # 现在 refined_adj 非常稀疏，且结构合理
+                # 过滤掉低概率边
+                final_adj = (refined_adj > threshold).float()
+
+                # 6. 取最大连通分量 (保证连通性)
+                # 复用你之前的逻辑
+                sub_nodes, sub_edges = self._largest_connected_component(final_adj)
+
+                # 排序与提取
+                sub_nodes = torch.tensor(sorted(list(sub_nodes)), dtype=torch.long, device=device)
+
+                # 限制大小 (避免图太大)
+                max_gen_nodes = self.max_gen_nodes
+                if sub_nodes.numel() > max_gen_nodes:
+                    # 按节点度数/重要性剪枝
+                    pass  # (保留你原有的剪枝逻辑)
+
+                # 提取最终子图数据
+                # 注意：这里生成的 node_feats 应该是 generator 重构的特征，还是原图特征？
+                # 建议：使用原图特征 x_src，这样解释性更强（"这是从真实数据中提炼的"）
+                # 或者使用 generator 的输出 node_feats (更加抽象、平滑)
+                # 为了 Hybrid 的故事，使用 generator 的输出 node_feats 更好，代表"理想化"
+                node_feats_sub = decoder_out["node_feats"][0][sub_nodes].detach().cpu()
+
+                # 构建边列表
+                A_new_sub = final_adj[sub_nodes][:, sub_nodes]
+                edge_index_new = (A_new_sub > 0).nonzero(as_tuple=False).t().contiguous().detach().cpu()
+
+                # 封装结果
+                graph_data = Data(
+                    x=node_feats_sub,
+                    edge_index=edge_index_new,
+                    y=torch.tensor([p_idx // self.num_prototypes_per_class], dtype=torch.long),
+                    prototype_idx=torch.tensor([p_idx], dtype=torch.long),
                 )
 
-                # 现在graph_embedding是通过读出函数计算得到的，维度为[1, proto_dim]
-                candidate_embeddings.append(graph_emb)
-                candidate_adj_hard.append(single_adj_hard)
-                candidate_adj_soft.append(single_adj_soft)
-                candidate_node_features.append(single_node_features)
-                candidate_node_types.append(single_node_types)
-                candidate_edge_logits.append(edge_logits)  # 存储边logits
-                candidate_edge_probs.append(edge_probs)
-                candidate_graph_data.append(graph_data)  # 存储图数据
-                candidate_node_lists.append(node_list)  # 存储节点列表
+                # 存入列表
+                graph_data = graph_data.to(device)
+                batch_data = Batch.from_data_list([graph_data])
+                _, _, _, graph_emb, _ = self.forward(batch_data)  # 获取生成图的嵌入用于对齐 loss
 
-            # 合并所有候选
-            if candidate_embeddings:
-                self.generated_candidates = {
-                    'embeddings': torch.cat(candidate_embeddings, dim=0),
-                    'adj_matrices_hard': candidate_adj_hard,
-                    'adj_matrices_soft': candidate_adj_soft,
-                    'node_features': candidate_node_features,
-                    'node_types': candidate_node_types,
-                    'edge_logits': candidate_edge_logits,
-                    'edge_probs': candidate_edge_probs,
-                    'graph_data': candidate_graph_data,
-                    'node_lists': candidate_node_lists
-                }
+                candidate_embeddings.append(graph_emb)
+                candidate_graph_data.append(graph_data)
+                candidate_node_features.append(node_feats_sub)
+
+        if was_training:
+            self.train()
+
+        if candidate_embeddings:
+            self.generated_candidates = {
+                "embeddings": torch.cat(candidate_embeddings, dim=0),
+                "node_features": candidate_node_features,
+                "graph_data": candidate_graph_data,
+            }
+        else:
+            self.generated_candidates = None
 
         return self.generated_candidates
 
-    # 从生成创建图数据
-    def _create_graph_data_from_generated(self, node_features, adj_hard, node_types, prototype_idx):
-        # 确保节点特征在CPU上
-        node_features = node_features.detach().cpu()
-        adj_matrix = adj_hard.detach().cpu()
-        node_types = node_types.detach().cpu()
-
-        # 获取非零元素的索引（边）
-        edge_index = torch.nonzero(adj_hard, as_tuple=False).t()
-
-        # 创建节点列表
-        num_nodes = node_features.shape[0]
-        node_list = [j for j in range(num_nodes)]
-
-        # 创建PyG Data对象
-        graph_data = Data(
-            x=node_features,
-            edge_index=edge_index,
-            y=torch.tensor([prototype_idx // self.num_prototypes_per_class]),  # 类别标签
-            prototype_idx=torch.tensor([prototype_idx]),  # 原型索引
-            node_types=node_types  # 节点类型
-        )
-
-        return graph_data, node_list
-
     # 计算重构损失
-    def compute_reconstruction_loss(self):
+    def reconstruction_loss(self, batch_data=None):
         """
-        纯自监督版本的重构损失：
-        - 使用 decoder 对候选原型图生成 edge_logits
-        - 将 edge_logits.sigmoid() 二值化/或用 soft label 得到 target_adj (detach)
-        - 对两个之间做 BCEWithLogitsLoss
+        [修正] 引入自编码任务 (Auto-Encoder Task)
+        使用当前的 Graph Decoder 重构输入的真实 Batch 数据。
+        这教会生成器什么是“合理的图结构”。
         """
-        # 确保已经有生成结果
-        if self.generated_candidates is None:
-            self.generate_candidate_prototypes()
-
-        if self.generated_candidates is None:
+        if batch_data is None:
+            # 如果没传 batch，退化为 0 (或者你可以保留旧逻辑作为正则，但不推荐)
             return torch.tensor(0.0, device=self.device)
 
-        edge_logits_list = self.generated_candidates['edge_logits']
-        bce_logits = torch.nn.BCEWithLogitsLoss()
-        total_rec_loss = torch.tensor(0.0, device=self.device)
-        num_used = 0
+        # 1. 获取 Batch 中真实节点的嵌入 (来自 GNN Encoder 的中间层输出)
+        # 注意：我们需要 node_emb，这通常在 forward 的时候已经算过了。
+        # 为了避免重复计算，我们可以让 train loop 传进来，或者在这里重新 forward 一次
+        # 这里为了代码解耦，假设 batch_data 是原始数据，我们重新编码获取 node_emb
 
-        for p, edge_logits in enumerate(edge_logits_list):
-            if edge_logits is None:
-                continue
+        # 使用 self.gnn_layers 提取特征 (不经过 last_layer)
+        x, edge_index = batch_data.x, batch_data.edge_index
+        for i in range(self.num_gnn_layers):
+            x = self.gnn_layers[i](x, edge_index)
+            if self.emb_normalize:
+                x = F.normalize(x, p=2, dim=-1)
+            x = self.gnn_non_linear(x)
+        real_node_emb = x  # [Total_Nodes, d]
 
-            edge_logits = edge_logits.to(self.device)
-            if edge_logits.dim() == 3:
-                edge_logits = edge_logits[0]  # [N,N]
-            N = edge_logits.size(0)
+        # 2. 使用 Decoder 重构邻接关系
+        # 注意：这里是对 Batch 里所有图的所有节点进行解码
+        # 为了效率，我们只采样一部分边，或者只对每个子图内部做解码
+        # 简单起见，利用 PyG 的 batch 属性，只计算同一图内部的边概率
 
-            # 使用自身的 sigmoid 作为 target（或者二值化）
-            with torch.no_grad():
-                # soft label 版本
-                # target_adj = torch.sigmoid(edge_logits).detach()
-                # hard label 版本：
-                target_adj = (torch.sigmoid(edge_logits) > 0.5).float().detach()
+        decoder_out = self.graph_decoder(real_node_emb)
+        edge_logits = decoder_out['edge_logits']  # 注意：这里 graph_decoder 假设输入是 [B, N, d]
 
-            # 只对非对角线元素算 BCE
-            mask = ~torch.eye(N, dtype=torch.bool, device=self.device)
-            logits_flat = edge_logits[mask]
-            target_flat = target_adj[mask]
+        # !重要修正!：你的 graph_decoder 实现是针对 [B, N, d] 的 (原型是这样的)。
+        # 但这里的 real_node_emb 是 [Total_Nodes, d] (PyG 格式)。
+        # 我们需要适配一下 graph_decoder 或者在这里手写一个内积解码
 
-            rec_loss_p = bce_logits(logits_flat, target_flat)
-            total_rec_loss = total_rec_loss + rec_loss_p
-            num_used += 1
+        # --- 手写适配 PyG Batch 的解码 ---
+        node_feats = self.node_mlp(real_node_emb)  # [Total_Nodes, d_out]
 
-        if num_used == 0:
-            return torch.tensor(0.0, device=self.device)
+        # 为了计算 BCE，我们需要正样本（存在的边）和负样本（不存在的边）
 
-        reconstruction_loss = total_rec_loss / num_used
-        return reconstruction_loss
+        # 正样本：batch_data.edge_index
+        src, dst = batch_data.edge_index
+        pos_score = (node_feats[src] * node_feats[dst]).sum(dim=-1) * self.logit_scale
+        pos_loss = -F.logsigmoid(pos_score).mean()
 
-    def compute_alignment_loss(self):
+        # 负样本：随机采样
+        neg_src = torch.randint(0, batch_data.num_nodes, (src.size(0),), device=self.device)
+        neg_dst = torch.randint(0, batch_data.num_nodes, (src.size(0),), device=self.device)
+        # (简单采样，不严格排除正样本，在大图中影响不大；严格做法需用 negative_sampling)
+        from torch_geometric.utils import negative_sampling
+        neg_edge_index = negative_sampling(edge_index, num_nodes=batch_data.num_nodes)
+
+        neg_src, neg_dst = neg_edge_index
+        neg_score = (node_feats[neg_src] * node_feats[neg_dst]).sum(dim=-1) * self.logit_scale
+        neg_loss = -F.logsigmoid(-neg_score).mean()
+
+        rec_loss = pos_loss + neg_loss
+        return rec_loss
+
+    def alignment_loss(self):
         """
             计算对齐约束 - 生成候选应与原型嵌入靠近
             L_align = (1/C×m) ∑∑ ||g_{ck} ^G - {p}_{ck} ^G||_2^2
         """
+        # 1. 只有当缓存为空时才生成 (通常在 Epoch 开始时会被清空一次)
+        if self.generated_candidates is None:
+            self.generate_candidate_prototypes(threshold=0.9)
+
         if self.generated_candidates is None:
             return torch.tensor(0.0).to(self.device)
 
         generated_embs = self.generated_candidates['embeddings']
-
         prototype_graph_emb = self.proto_node_emb_2_graph_emb()
 
-        alignment_loss = F.mse_loss(generated_embs, prototype_graph_emb)
+        # 2. [关键修复] 强制归一化
+        # 确保两个向量都在单位球面上，MSE 范围被限制在 [0, 4]
+        # 避免几万的 Loss 冲垮模型
+        gen_norm = F.normalize(generated_embs, p=2, dim=-1)
+        proto_norm = F.normalize(prototype_graph_emb, p=2, dim=-1)
+
+        alignment_loss = F.mse_loss(gen_norm, proto_norm)
+
         return alignment_loss
 
-    def compute_proto_loss(self, init_proto_graph_emb=None):
-        if init_proto_graph_emb is None:
-            return torch.tensor(0.0).to(self.device)
-        prototype_graph_emb = self.proto_node_emb_2_graph_emb()
-        proto_loss = F.mse_loss(init_proto_graph_emb, prototype_graph_emb)
+    def proto_loss(self):
+        # [修改] 使用动态 anchor_graph_emb 作为 target
+        if not hasattr(self, "anchor_graph_emb"):
+            return torch.tensor(0.0, device=self.device)
 
-        return proto_loss
+        # 当前学到的抽象原型
+        proto_graph_emb = self.proto_node_emb_2_graph_emb()
+        # 动态更新的真实子图锚点
+        target_emb = self.anchor_graph_emb.to(self.device)
 
-    def compute_diversity_loss(self):
+        if target_emb.dim() == 3 and target_emb.size(1) == 1:
+            target_emb = target_emb.squeeze(1)
+
+        return F.mse_loss(proto_graph_emb, target_emb)
+
+    def diversity_loss(self):
         diversity_loss = torch.tensor(0.0, device=self.device)
         prototype_graph_emb = self.proto_node_emb_2_graph_emb()
         for c in range(self.output_dim):

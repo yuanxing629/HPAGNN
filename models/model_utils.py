@@ -17,185 +17,94 @@ def get_readout_layers(readout):
     return ret_readout
 
 
-def build_subgraph_adj(node_indices, edge_index, num_nodes):
-    """
-    给定一个图的 edge_index 和一个子图节点列表 node_indices，
-    构造该子图的邻接矩阵（K×K），节点顺序按 node_indices 的顺序。
-    """
-    device = edge_index.device
-    node_indices = list(node_indices)
-    K = len(node_indices)
-    idx_map = {old_idx: new_idx for new_idx, old_idx in enumerate(node_indices)}
-
-    A = torch.zeros(K, K, device=device)
-    src, dst = edge_index
-
-    for u, v in zip(src.tolist(), dst.tolist()):
-        if u in idx_map and v in idx_map:
-            i = idx_map[u]
-            j = idx_map[v]
-            A[i, j] = 1.0
-            A[j, i] = 1.0  # 无向图
-
-    # 去掉自环
-    eye = torch.eye(K, device=device)
-    A = A * (1.0 - eye)
-    return A
 
 
 class GraphDecoder(nn.Module):
-    """
-    Prototype node embeddings -> graph:
-      - inner-product edge decoder
-      - node-type classifier head
-      - optional graph embedding via external graph encoder, else READOUT
-
-    Inputs
-    ------
-    prototype_node_emb: [N,d] or [B,N,d]
-    tau: float or None         # Gumbel temperature; None -> plain sigmoid
-    hard: bool                 # return STE hard adjacency
-    use_soft_adj_for_encoder: bool  # True: 用 adj_soft 进 encoder；False: 用 adj_hard（若可用）
-    graph_encoder: callable or None # (adj:[B,N,N], x:[B,N,F_enc]) -> [B,D]
-    readout: str               # 'mean' | 'sum'  (当 graph_encoder is None 时使用)
-    Returns (dict)
-      node_feats:   [B,N,F_edge]   # 用于边解码/编码器的节点隐向量
-      node_logits:  [B,N,C]        # 节点类型logits
-      node_type_probs: [B,N,C]
-      node_type_ids:   [B,N]
-      edge_logits:  [B,N,N]
-      edge_probs:   [B,N,N]
-      adj_soft:     [B,N,N]
-      adj_hard:     [B,N,N] or None
-      graph_emb:    [B,D]          # 经 graph_encoder 或 READOUT 得到
-    """
-
     def __init__(
             self,
-            proto_dim: int,  # 原型节点嵌入维度 d
-            hidden_dim: int = 128,  # 中间隐层维度
-            edge_feat_dim: int = 128,  # 用于边解码/读出的节点特征维度
-            num_node_classes: int = 7,  # 节点类型类别数（如 MUTAG 7类）
+            proto_dim: int,              # 原型节点嵌入维度 d
+            num_node_features: int,      # 数据集原始节点特征维度
+            hidden_dim: int = 128,       # 中间隐层维度
             use_bias: bool = True,
     ):
         super().__init__()
         self.proto_dim = proto_dim
         self.hidden_dim = hidden_dim
-        self.edge_feat_dim = edge_feat_dim
-        self.num_node_classes = num_node_classes
+        self.num_node_features = num_node_features
 
-        # 基础 MLP: prototype_node_emb -> node_hidden
-        self.backbone = nn.Sequential(
+        # 两层 MLP：H̃ -> 节点属性 X̃
+        self.node_mlp = nn.Sequential(
             nn.Linear(proto_dim, hidden_dim, bias=use_bias),
             nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, num_node_features, bias=use_bias),
         )
-        # 到用于边解码/编码器的节点隐向量
-        self.edge_feat_head = nn.Linear(hidden_dim, edge_feat_dim, bias=use_bias)
-        # 节点类型分类头（原子类别 logits）
-        self.node_cls_head = nn.Linear(hidden_dim, num_node_classes, bias=use_bias)
 
         # 内积解码的可学习缩放
-        self.logit_scale = nn.Parameter(torch.tensor(1.0))  # 训练过程中，logit_scale 会自动学习一个合适的温度
+        self.logit_scale = nn.Parameter(torch.tensor(1.0))
 
-    @staticmethod
-    def _ensure_batch(x):
-        # 如果传进来的原型节点嵌入是[n, d](单图)，会把它变成[1, N, d]
-        if x.dim() == 2:
-            x = x.unsqueeze(0)
-        return x
+        # graph_emb 维度对齐到 proto_dim 时用
+        self.projection = None
+
 
     @staticmethod
     def _sym_clean(A, symmetric=True, remove_self_loops=True):
         if symmetric:
-            A = 0.5 * (A + A.transpose(-1, -2))  # 强制对称(无向图)
+            A = 0.5 * (A + A.transpose(-1, -2))
         if remove_self_loops:
             idx = torch.arange(A.size(-1), device=A.device)
-            A[..., idx, idx] = 0.0  # 对角线全置0，去掉自环
+            A[..., idx, idx] = 0.0
         return A
 
-    @staticmethod
-    def _gumbel_sigmoid(logits, tau=1.0, hard=False, eps=1e-10):
-        u = torch.rand_like(logits)  # u ~ U(0, 1)
-        g = -torch.log(-torch.log(u + eps) + eps)
-        y = torch.sigmoid((logits + g) / max(tau, 1e-6))
-        if hard:  # straight-Through Estimator。正向是hard二值，反向梯度从soft y 传
-            y_hard = (y > 0.5).float()
-            y = y_hard.detach() - y.detach() + y
-        return y
-
     def forward(
-            self,
-            prototype_node_emb: torch.Tensor,
-            tau: float = None,
-            hard: bool = False,
-            symmetric: bool = True,
-            remove_self_loops: bool = True,
-            readout_layers=None,
-            batch=None
+        self,
+        prototype_node_emb: torch.Tensor,
+        hard: bool = False,      # 这里的 hard 只决定是否直接二值化；Tl/Th 在外面做
+        readout_layers=None,
+        batch=None,
     ):
-        # 1) batch 统一
-        H = self._ensure_batch(prototype_node_emb)  # [B,N,d]
+        # 1) batch 统一: [B, N, d]
+        # 若输入 [N, d] -> [1, N, d]
+        if prototype_node_emb.dim() == 2:
+            prototype_node_emb = prototype_node_emb.unsqueeze(0)
+        H = prototype_node_emb
         B, N, _ = H.shape
 
-        # 2) 节点隐向量 + 两个头：edge特征 & 节点类型
-        node_hidden = self.backbone(H)  # [B,N,H]
-        node_feats = self.edge_feat_head(node_hidden)  # [B,N,F_edge]  用于边解码/编码器
-        node_logits = self.node_cls_head(node_hidden)  # [B,N,C]
-        node_type_probs = torch.softmax(node_logits, dim=-1)  # [B,N,C]
-        node_type_ids = node_type_probs.argmax(dim=-1)  # [B,N]
-        num_nodes = node_feats.size(1)
+        # 2) 两层 MLP 生成节点属性（重构 X）
+        node_feats = self.node_mlp(H)            # [B, N, F_x], F_x = num_node_features
 
-        # 3) 内积解码
-        # 用内积表示节点之间建边的倾向
-        edge_logits = torch.bmm(node_feats, node_feats.transpose(1, 2)) * self.logit_scale  # [B,N,N]
-        if tau is None:
-            edge_probs = torch.sigmoid(edge_logits)
-        else:
-            edge_probs = self._gumbel_sigmoid(edge_logits, tau=tau, hard=False)
+        # 3) 内积解码得到边 logits / 概率
+        edge_logits = torch.bmm(node_feats, node_feats.transpose(1, 2)) * self.logit_scale  # [B, N, N]
+        edge_probs = torch.sigmoid(edge_logits)
 
-        adj_soft = self._sym_clean(edge_probs, symmetric=symmetric, remove_self_loops=remove_self_loops)
+        adj_soft = self._sym_clean(edge_probs) # 对称化&移除自环
 
-        # 4) 硬邻接（可选）
+        # 4) 可选：粗硬阈值（真正的 Tl/Th 过滤我们在外面用 init_graph 再做一次）
         adj_hard = None
         if hard:
-            if tau is None:
-                y_hard = (adj_soft > 0.5).float()
-                adj_hard = y_hard.detach() - adj_soft.detach() + adj_soft
-            else:
-                y = self._gumbel_sigmoid(edge_logits, tau=tau, hard=True)
-                adj_hard = self._sym_clean(y, symmetric=symmetric, remove_self_loops=remove_self_loops)
+            y_hard = (adj_soft > 0.5).float()
+            adj_hard = y_hard.detach() - adj_soft.detach() + adj_soft
 
-        # 5) graph_emb：默认就做 READOUT；如果传入 readout_layers 就用它们并投到 proto_dim
+        # 5) graph_emb：对 node_feats 做 READOUT，再投到 proto_dim
         if readout_layers is None:
-            # 默认：对 node_feats 做 mean 读出
-            graph_emb = node_feats.mean(dim=1)  # [B, edge_feat_dim]
-            # 如需强制等维到 proto_dim，可投影
-            if graph_emb.size(-1) != self.proto_dim:
-                if not hasattr(self, 'projection'):
-                    self.projection = nn.Linear(graph_emb.size(-1), self.proto_dim).to(prototype_node_emb.device)
-                graph_emb = self.projection(graph_emb)
+            graph_emb = node_feats.mean(dim=1)   # [B, F_x]
         else:
-            # 对 batch 里每个图做 pooling
-            node_for_pool = node_feats  # 也可用 node_hidden
-            node_feats_flat = node_for_pool.reshape(-1, node_for_pool.size(-1))  # [B, N, F] -> [B * N, F]
+            node_feats_flat = node_feats.reshape(-1, node_feats.size(-1))  # [B*N, F_x]
             if batch is None:
-                batch_indices = torch.arange(B, device=prototype_node_emb.device).unsqueeze(1).repeat(1, N).reshape(-1)
+                batch_indices = torch.arange(B, device=H.device).unsqueeze(1).repeat(1, N).reshape(-1)
             pooled = [readout(node_feats_flat, batch_indices) for readout in readout_layers]
             graph_emb = torch.cat(pooled, dim=-1)
-            if graph_emb.size(-1) != self.proto_dim:
-                if not hasattr(self, 'projection'):
-                    self.projection = nn.Linear(graph_emb.size(-1), self.proto_dim).to(prototype_node_emb.device)
-                graph_emb = self.projection(graph_emb)
+
+        if graph_emb.size(-1) != self.proto_dim:
+            if self.projection is None:
+                self.projection = nn.Linear(graph_emb.size(-1), self.proto_dim).to(H.device)
+            graph_emb = self.projection(graph_emb)
 
         return {
-            "node_feats": node_feats,
-            "node_logits": node_logits,
-            "node_type_probs": node_type_probs,
-            "node_type_ids": node_type_ids,
-            "edge_logits": edge_logits, # 重构损失L_rec对它做BCEWithLogits
+            "node_feats": node_feats,   # 用于节点属性重构 + 生成
+            "edge_logits": edge_logits,
             "edge_probs": edge_probs,
             "adj_soft": adj_soft,
-            "adj_hard": adj_hard, # 用来构造PyG的edge_index（通过nonzero）；作为生成图的真实离散结构
-            "graph_emb": graph_emb,  # 始终 [B, 128] 在alignment_loss中用它和原型的图级嵌入做MSE对齐
+            "adj_hard": adj_hard,       # 粗硬邻接（可不用）
+            "graph_emb": graph_emb,     # 对齐到 proto_dim 的图级嵌入
         }
 

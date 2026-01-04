@@ -50,8 +50,6 @@ class GINClassifier(nn.Module):
 
         self.gnn_non_linear = nn.ReLU()
 
-        self.bn = nn.BatchNorm1d(self.latent_dim[-1])
-
         self.mlp = nn.Linear(self.latent_dim[-1], output_dim)
         self.Softmax = nn.Softmax(dim=-1)
 
@@ -77,9 +75,7 @@ class GINClassifier(nn.Module):
             pooled.append(readout(x, batch))
         x = torch.cat(pooled, dim=1)
         graph_emb = x
-        graph_emb = self.bn(graph_emb)
 
-        graph_emb = F.dropout(graph_emb, p=0.5, training=self.training)
         logits = self.mlp(graph_emb)
         probs = self.Softmax(logits)
         return logits, probs, node_emb, graph_emb

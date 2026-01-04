@@ -1,6 +1,10 @@
 import torch
 import torch.nn.functional as F
 from Configures import model_args
+from torch_geometric.utils import subgraph, to_networkx
+from torch_geometric.data import Data
+import torch.optim as optim
+import networkx as nx
 
 
 def calculate_similarity(graph_emb1, graph_emb2):
@@ -19,203 +23,131 @@ def calculate_similarity(graph_emb1, graph_emb2):
     return similarity, distance
 
 
-# def greedy_match_prototype_on_graph(
-#         node_emb,  # [N, d] 该真实图的节点嵌入
-#         edge_index,  # [2, E]
-#         prototype_node_emb: torch.Tensor,  # [M, d] 这个原型的节点嵌入 (graph_size = M)
-#         ensure_connected: bool = True,
-# ):
-#     """
-#     在一张真实图上，用贪心方法搜索与某个“节点级原型”最相似的子图。
-#     返回:
-#       - best_sub_nodes: List[int]      最相似子图的节点索引集合
-#       - best_sim: float                原型图嵌入 vs 子图图嵌入 的相似度
-#       - best_sub_node_emb: [K, d]      该子图的节点嵌入 (K <= graph_size)
-#       - best_sub_graph_emb: [d]        该子图的图嵌入 (简单 mean-pool 或 readout)
-#     """
-#
-#     N, d = node_emb.size()  # N 为该真实图的节点个数
-#     M = prototype_node_emb.size(0)  # M 为该原型的节点个数
-#     graph_size = model_args.graph_size
-#     if graph_size is None:
-#         graph_size = M
-#     graph_size = min(graph_size, N)  # 子图节点数不可能超过整图
-#
-#     # 1) 原型图嵌入: 对原型节点嵌入做 READOUT
-#     if model_args.readout == 'max':
-#         proto_graph_emb = prototype_node_emb.max(dim=0)[0]
-#     elif model_args.readout == 'sum':
-#         proto_graph_emb = prototype_node_emb.sum(dim=0)
-#     else:
-#         proto_graph_emb = prototype_node_emb.mean(dim=0)
-#
-#     proto_graph_emb = F.normalize(proto_graph_emb, dim=0)  # 归一化
-#
-#     # 2) 归一化真实图节点嵌入 & 预先算好每个节点与原型的单点相似度
-#     H = node_emb  # [N, d]
-#     H_norm = F.normalize(H, dim=1)  # [N, d]
-#     node_scores = torch.mv(H_norm, proto_graph_emb)  # [N]
-#
-#     # 3) 建邻接表 (list 形式)，用于贪心扩展保持连通性
-#     src, dst = edge_index
-#     src = src.detach().cpu().tolist()
-#     dst = dst.detach().cpu().tolist()
-#     adj_list = [[] for _ in range(N)]
-#     for u, v in zip(src, dst):
-#         adj_list[u].append(v)
-#         adj_list[v].append(u)
-#
-#     best_sim = -1e9
-#     best_sub_nodes = None
-#     best_sub_node_emb = None
-#     best_sub_graph_emb = None
-#
-#     # 4) 以每个节点为起点，贪心扩展一个大小 ≤ graph_size 的连通子图
-#     for v0 in range(N):
-#         sub_nodes = {v0}
-#         frontier = {v0}
-#
-#         while len(sub_nodes) < graph_size and len(frontier) > 0:
-#             # 收集当前 frontier 的一阶邻居作为候选
-#             candidates = set()
-#             for u in frontier:
-#                 for w in adj_list[u]:
-#                     if w not in sub_nodes:
-#                         candidates.add(w)
-#
-#             if not candidates:
-#                 # fallback：连通区域扩不动了，但 sub_nodes 还没到 graph_size
-#                 # 从整个图剩余的节点里，挑相似度最高的若干个补齐
-#                 remaining = [idx for idx in range(N) if idx not in sub_nodes]
-#                 if not remaining:
-#                     break  # 图里已经没有可用节点了
-#
-#                 needed = graph_size - len(sub_nodes)
-#                 remaining_sorted = sorted(
-#                     remaining, key=lambda idx: float(node_scores[idx]), reverse=True
-#                 )
-#                 for idx in remaining_sorted[:needed]:
-#                     sub_nodes.add(idx)
-#                 # 补齐之后就可以退出 while
-#                 break
-#
-#             # 在候选中选出 node_scores 最高的一个点加入子图
-#             best_cand = max(candidates, key=lambda idx: float(node_scores[idx]))
-#             sub_nodes.add(best_cand)
-#
-#             if ensure_connected:
-#                 frontier = {best_cand}
-#             else:
-#                 frontier.add(best_cand)
-#
-#         # 得到当前起点对应的候选子图节点集合
-#         sub_nodes_list = sorted(list(sub_nodes))
-#         H_sub = H[sub_nodes_list]  # [K, d]
-#
-#         # 5) 对子图节点嵌入做 READOUT 得到子图图嵌入 [d]
-#         if model_args.readout == 'max':
-#             sub_graph_emb = H_sub.max(dim=0)[0]
-#         elif model_args.readout == 'sum':
-#             sub_graph_emb = H_sub.sum(dim=0)
-#         else:
-#             sub_graph_emb = H_sub.mean(dim=0)
-#
-#         sub_graph_emb = F.normalize(sub_graph_emb, dim=0)
-#
-#         # 6) 和原型图嵌入做相似度（cos）
-#         sim_tensor, _ = calculate_similarity(proto_graph_emb, sub_graph_emb)
-#         sim = float(sim_tensor.squeeze().item())
-#
-#         # 7) 记录最优子图
-#         if sim > best_sim:
-#             best_sim = sim
-#             best_sub_nodes = sub_nodes_list
-#             best_sub_node_emb = H_sub
-#             best_sub_graph_emb = sub_graph_emb
-#
-#     return best_sub_nodes, best_sim, best_sub_node_emb, best_sub_graph_emb
-
-@torch.no_grad()
-def match_connected_subgraph(
-    node_emb: torch.Tensor,            # [N, d] 真实图节点嵌入
-    edge_index: torch.Tensor,          # [2, E]
-    prototype_node_emb: torch.Tensor,  # [M, d]（或 [graph_size, d]）
+def differentiable_search_subgraph(
+        proto_graph_emb,
+        source_data,  # 传入完整的 Data 对象 (包含 x, edge_index)
+        model,
+        min_nodes: int = 5,
+        max_nodes: int = 12,
+        iterations: int = 100,  # 优化步数
+        lr: float = 0.05,  # 学习率
+        l1_reg: float = 0.1,  # 稀疏性惩罚权重
+        lambda_entropy: float = 0.1,  # [新增] 熵正则权重
 ):
     """
-    连通约束的贪心匹配（单源多边界法）：
-    - 初始化：选全图与原型图最相似的节点作为起点；
-    - 迭代：每步只从当前子图的“边界邻居”中选一个分数最高的节点加入；
-    - 若边界为空则停止（保持连通），选到 <= graph_size 个节点。
-    返回：
-      sub_nodes: List[int]（连通）
-      sub_edges: List[(u,v)]（诱导边）
-      sim: float  （原型图嵌入 vs 匹配子图嵌入 的余弦相似）
+    使用梯度下降优化节点掩码，寻找与原型最相似的连通子图。
     """
-    N, d = node_emb.size()
-    device = node_emb.device
-    graph_size = max(1, min(int(model_args.graph_size), N))
-    readout = model_args.readout
+    device = source_data.x.device
+    num_nodes = source_data.num_nodes
 
-    # 1) 原型图嵌入
-    if readout == 'max':
-        proto_graph_emb = prototype_node_emb.max(dim=0)[0]
-    elif readout == 'sum':
-        proto_graph_emb = prototype_node_emb.sum(dim=0)
-    else:
-        proto_graph_emb = prototype_node_emb.mean(dim=0)
-    proto_graph_emb = F.normalize(proto_graph_emb, dim=0)  # [d]
+    # 初始化：给一点随机噪声防止陷入鞍点
+    mask_logits = torch.nn.Parameter(torch.randn(num_nodes, device=device) * 0.1)
 
-    # 2) 节点与原型图的相似得分（余弦）
-    H = node_emb
-    H_norm = F.normalize(H, dim=1)        # [N, d]
-    node_scores = torch.mv(H_norm, proto_graph_emb)  # [N]
+    # 只优化 mask，冻结模型
+    optimizer = optim.Adam([mask_logits], lr=lr)
+    model.eval()
 
-    # 3) 邻接表
-    src, dst = edge_index
-    src = src.detach().cpu().tolist()
-    dst = dst.detach().cpu().tolist()
-    adj_list = [[] for _ in range(N)]
-    for u, v in zip(src, dst):
-        if u == v:
-            continue
-        adj_list[u].append(v)
-        adj_list[v].append(u)
+    # 目标原型嵌入 [1, d]
+    if proto_graph_emb.dim() == 1:
+        proto_graph_emb = proto_graph_emb.unsqueeze(0)
+    target = proto_graph_emb.detach()
 
-    # 4) 初始化：选分数最高的节点作为起点
-    start = int(torch.argmax(node_scores).item())
-    sub_nodes = {start}
+    with torch.enable_grad():
+        for i in range(iterations):
+            optimizer.zero_grad()
 
-    # 5) 连通贪心生长：每次只从“子图的所有边界邻居”里挑最高分的一个
-    while len(sub_nodes) < graph_size:
-        candidates = set()
-        for u in list(sub_nodes):
-            for w in adj_list[u]:
-                if w not in sub_nodes:
-                    candidates.add(w)
-        if not candidates:
-            break
-        best_cand = max(candidates, key=lambda idx: float(node_scores[idx]))
-        sub_nodes.add(best_cand)
+            mask = torch.sigmoid(mask_logits)
 
-    sub_nodes_list = sorted(list(sub_nodes))
-    # 诱导边
-    edges_set = set()
-    for u in sub_nodes_list:
-        for v in adj_list[u]:
-            if v in sub_nodes and u < v:
-                edges_set.add((u, v))
-    sub_edges_list = sorted(list(edges_set))
+            # 将 mask 应用到特征
+            # 注意：source_data.x 不需要梯度，但 mask 需要，乘积 masked_x 会有梯度
+            masked_x = source_data.x * mask.view(-1, 1)
 
-    # 6) 匹配子图的图嵌入 & 与原型图相似
-    H_sub = H[sub_nodes_list]  # [K', d]
-    if readout == 'max':
-        sub_graph_emb = H_sub.max(dim=0)[0]
-    elif readout == 'sum':
-        sub_graph_emb = H_sub.sum(dim=0)
-    else:
-        sub_graph_emb = H_sub.mean(dim=0)
-    sub_graph_emb = F.normalize(sub_graph_emb, dim=0)
-    sim,_ = calculate_similarity(proto_graph_emb,sub_graph_emb)
-    sim = float(sim.squeeze().item())
+            # 构造临时数据
+            masked_data = source_data.clone()
+            masked_data.x = masked_x
+            if not hasattr(masked_data, "batch") or masked_data.batch is None:
+                masked_data.batch = torch.zeros(num_nodes, dtype=torch.long, device=device)
 
-    return sub_nodes_list, sub_edges_list, sim
+            # 前向传播
+            # 即使 model 在 eval 模式，只要输入 masked_x 有梯度，输出就会有梯度
+            _, _, _, current_graph_emb, _ = model(masked_data)
+
+            # 计算 Loss
+            sim_loss = torch.nn.functional.mse_loss(current_graph_emb, target)
+
+            # L1 Loss: 推动 mask -> 0
+            size_loss = torch.mean(mask)
+
+            # Entropy Loss: 推动 mask -> 0 或 1 (二值化)
+            # H = -p*log(p) - (1-p)*log(1-p)
+            entropy = -mask * torch.log(mask + 1e-8) - (1 - mask) * torch.log(1 - mask + 1e-8)
+            entropy_loss = entropy.mean()
+
+            # 组合 Loss
+            loss = sim_loss + l1_reg * size_loss + lambda_entropy * entropy_loss
+
+            # 反向传播
+            loss.backward()
+            optimizer.step()
+
+    # 3. 严格的连通性后处理
+    with torch.no_grad():
+        final_mask = torch.sigmoid(mask_logits)
+
+        # 1. 确定“种子”：Mask 值最大的那个节点，一定得选
+        best_node_idx = torch.argmax(final_mask).item()
+
+        # 2. 构建 NetworkX 图用于拓扑分析
+        G = to_networkx(source_data, to_undirected=True)
+
+        # 3. 广度优先搜索 (BFS) 扩展
+        # 从种子出发，优先访问 Mask 值高的邻居
+        # 只要节点数没到 max_nodes，且邻居的 Mask 值超过阈值，就加入
+
+        selected_nodes = {best_node_idx}
+        candidates = []  # (mask_value, node_idx)
+
+        # 将种子的邻居加入候选队列
+        for neighbor in G.neighbors(best_node_idx):
+            candidates.append((final_mask[neighbor].item(), neighbor))
+
+        # 排序候选：Mask 值大的优先
+        candidates.sort(key=lambda x: x[0], reverse=True)
+
+        # 扩展循环
+        while len(selected_nodes) < max_nodes and candidates:
+            score, node = candidates.pop(0)  # 取出分数最高的
+
+            if node in selected_nodes:
+                continue
+
+            # 动态阈值：如果还没达到 min_nodes，门槛低一点；否则门槛高一点
+            threshold = 0.3 if len(selected_nodes) < min_nodes else 0.5
+
+            if score > threshold:
+                selected_nodes.add(node)
+                # 将新节点的邻居加入候选
+                new_neighbors = []
+                for nb in G.neighbors(node):
+                    if nb not in selected_nodes:
+                        new_neighbors.append((final_mask[nb].item(), nb))
+                # 重新排序 (简单起见，这里可以优化为优先队列)
+                candidates.extend(new_neighbors)
+                candidates.sort(key=lambda x: x[0], reverse=True)
+            else:
+                # 如果最高分的候选都不满足阈值，且已经满足最小节点数，提前退出
+                if len(selected_nodes) >= min_nodes:
+                    break
+
+        # 最终确认
+        final_node_indices = torch.tensor(list(selected_nodes), dtype=torch.long, device=device)
+        final_node_indices = torch.sort(final_node_indices)[0]
+
+        # 计算相似度返回
+        sub_edge_index, _ = subgraph(final_node_indices, source_data.edge_index, relabel_nodes=True)
+        final_data = Data(x=source_data.x[final_node_indices], edge_index=sub_edge_index)
+        final_data.batch = torch.zeros(final_data.num_nodes, dtype=torch.long, device=device)
+        _, _, _, final_emb, _ = model(final_data)
+        sim, _ = calculate_similarity(target, final_emb)
+
+        return set(final_node_indices.tolist()), float(sim.item())

@@ -7,6 +7,8 @@ import networkx as nx
 import matplotlib.pyplot as plt
 from torch_geometric.utils.num_nodes import maybe_num_nodes
 from textwrap import wrap
+from torch_geometric.utils import to_networkx
+
 
 
 # -----------------------------
@@ -103,7 +105,7 @@ def build_molecule_color_and_labels(dataset_name: str, x_tensor: Optional[torch.
     if dataset == "mutag":
         node_dict = {0: "C", 1: "N", 2: "O", 3: "F", 4: "I", 5: "Cl", 6: "Br"}
         palette = ["#F39C12", "#1ABC9C", "#E74C3C", "#9B59B6", "#F7DC6F", "#2ECC71", "#D35400"]
-    else:
+    elif dataset == "mutagenicity":
         node_dict = {
             0: "C",
             1: "O",
@@ -199,6 +201,24 @@ def _edge_logits_to_graph(edge_logits: torch.Tensor,
 class PlotUtils:
     def __init__(self, dataset_name: str):
         self.dataset_name = dataset_name
+
+    def save_graph(self, data, out_path):
+        """直接绘制一个 PyG Data 对象"""
+        G = to_networkx(data, to_undirected=True)
+
+        # 获取节点标签用于着色 (假设是 One-hot x)
+        labels = None
+        if data.x is not None:
+            labels = data.x.argmax(dim=1).tolist()
+
+        # 绘图逻辑 (复用你现有的 style)
+        plt.figure(figsize=(6, 6))
+        # ... (你的绘图代码, nx.draw 等)
+        # 例如:
+        pos = nx.kamada_kawai_layout(G)
+        nx.draw(G, pos, node_color=labels, cmap=plt.cm.Set2, with_labels=False)
+        plt.savefig(out_path)
+        plt.close()
 
     def plot_molecule(
             self,
@@ -515,3 +535,126 @@ class PlotUtils:
         plt.savefig(out_png, dpi=220, bbox_inches='tight')
         plt.close()
         return out_png
+
+    def save_generated_prototype_from_adj(self,
+                                          adj_hard: torch.Tensor,
+                                          adj_soft: torch.Tensor | None,
+                                          out_png: str,
+                                          *,
+                                          title: str | None = None):
+        """
+        基于生成原型的邻接矩阵(硬/软)绘制独立小图。
+        - adj_hard: [N, N] in {0,1}
+        - adj_soft: [N, N] in [0,1] (可选，用作边权重)
+        """
+
+
+
+        A = adj_hard.detach().cpu()
+        N = A.size(0)
+
+        # 构建 graph
+        G = nx.Graph()
+        G.add_nodes_from(range(N))
+
+        weights = {}
+        for i in range(N):
+            for j in range(i + 1, N):
+                if A[i, j] > 0:
+                    G.add_edge(i, j)
+                    if adj_soft is not None:
+                        w = float(adj_soft[i, j].item())
+                    else:
+                        w = 1.0
+                    weights[(i, j)] = w
+
+        plt.figure(figsize=(4.8, 4.2), dpi=220)
+
+        if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
+            plt.axis('off')
+            if title:
+                plt.title("\n".join(wrap(title, width=60)))
+            os.makedirs(os.path.dirname(out_png), exist_ok=True)
+            plt.savefig(out_png, dpi=220, bbox_inches='tight')
+            plt.close()
+            return out_png
+
+        pos = nx.kamada_kawai_layout(G)
+
+        # 节点颜色策略
+        ds = self.dataset_name.lower()
+        if ds in ("ba_2motifs", "ba_3motifs", "ba_shapes", "ba_grid"):
+            node_color = "#FF8C00"
+        else:
+            node_color = "#90CAF9"
+
+        nx.draw_networkx_nodes(
+            G, pos,
+            nodelist=list(G.nodes()),
+            node_color=node_color,
+            node_size=420,
+            linewidths=1.6,
+            edgecolors="#000000",
+        )
+
+        # 边：线宽随权重变化
+        widths = []
+        for e in G.edges():
+            w = weights.get(tuple(sorted(e)), 0.5)
+            widths.append(1.0 + 4.0 * float(w))
+        nx.draw_networkx_edges(
+            G, pos,
+            edgelist=list(G.edges()),
+            edge_color="#000000",
+            width=widths,
+            alpha=0.95,
+        )
+
+        plt.axis('off')
+        if title:
+            plt.title("\n".join(wrap(title, width=60)))
+        os.makedirs(os.path.dirname(out_png), exist_ok=True)
+        plt.savefig(out_png, dpi=220, bbox_inches='tight')
+        plt.close()
+        return out_png
+
+    def save_standalone_graph(self, data, out_path):
+        """
+        专门用于绘制生成的 Data 对象（不依赖背景大图）
+        """
+
+
+        # 转换为 networkx
+        G = to_networkx(data, to_undirected=True)
+
+        # 移除自环 (可选，生成图可能带有自环)
+        G.remove_edges_from(nx.selfloop_edges(G))
+
+        plt.figure(figsize=(6, 6))
+
+        # 节点颜色
+        ds = self.dataset_name.lower()
+        if ds in ("ba_2motifs", "ba_3motifs", "ba_shapes", "ba_grid"):
+            node_colors = "#FF8C00"
+        else:
+            node_colors = "#90CAF9"
+
+        # 布局
+        pos = nx.kamada_kawai_layout(G)
+        if len(G.nodes) == 0:
+            # 防止空图报错
+            plt.close()
+            return
+
+        # 绘图
+        nx.draw_networkx_nodes(G, pos, node_color=node_colors, cmap=plt.cm.Set2, node_size=300)
+        nx.draw_networkx_edges(G, pos, width=2.0, alpha=0.8)
+
+        # 如果需要显示 labels (原子类型等)，可以在这里添加 logic
+        # labels = {i: str(i) for i in G.nodes()}
+        # nx.draw_networkx_labels(G, pos, labels=labels)
+
+        plt.axis('off')
+        plt.tight_layout()
+        plt.savefig(out_path, dpi=300)
+        plt.close()
