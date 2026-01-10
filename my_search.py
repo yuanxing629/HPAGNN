@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn.functional as F
 from Configures import model_args
@@ -17,137 +18,132 @@ def calculate_similarity(graph_emb1, graph_emb2):
         graph_emb2 = graph_emb2.unsqueeze(0)  # [1, d]
 
     xp = torch.mm(graph_emb1, torch.t(graph_emb2))
-    distance = -2 * xp + torch.sum(graph_emb1 ** 2, dim=1, keepdim=True) + torch.t(
-        torch.sum(graph_emb2 ** 2, dim=1, keepdim=True))
+    distance = (-2 * xp + torch.sum(graph_emb1 ** 2, dim=1, keepdim=True) +
+                torch.t(torch.sum(graph_emb2 ** 2, dim=1, keepdim=True)))
+    distance = torch.clamp(distance, min=0.0)
     similarity = torch.log((distance + 1) / (distance + epsilon))
     return similarity, distance
 
 
+def post_process_topk_lcc(mask_values, source_data, min_nodes, max_nodes):
+    """
+    后处理策略：选取 Mask 最高的节点，提取诱导子图，保留其中的最大连通分量 (LCC)
+    """
+    mask_np = mask_values.detach().cpu().numpy()
+    edge_index = source_data.edge_index.detach().cpu().numpy()
+
+    # 选取前 K 个节点
+    k = max_nodes
+    topk_indices = np.argsort(mask_np)[-k:]
+    topk_set = set(topk_indices.tolist())
+
+    # 构建 NetworkX 图
+    G = nx.Graph()
+    G.add_nodes_from(topk_indices)
+    for u, v in edge_index.T:
+        if u in topk_set and v in topk_set:
+            G.add_edge(u, v)
+
+    # 选取最大连通分量
+    components = sorted(nx.connected_components(G), key=len, reverse=True)
+    if len(components) == 0:
+        return None
+    return list(components[0])
+
+
 def differentiable_search_subgraph(
         proto_graph_emb,
-        source_data,  # 传入完整的 Data 对象 (包含 x, edge_index)
+        source_data,
         model,
-        min_nodes: int = 5,
-        max_nodes: int = 12,
-        iterations: int = 100,  # 优化步数
-        lr: float = 0.05,  # 学习率
-        l1_reg: float = 0.1,  # 稀疏性惩罚权重
-        lambda_entropy: float = 0.1,  # [新增] 熵正则权重
+        min_nodes=3,
+        max_nodes=10,
+        iterations=50,
+        lr=0.05,
+        l1_reg=0.01,
+        lambda_entropy=0.01,
+        lambda_conn=0.1  # 连通性正则权重
 ):
     """
-    使用梯度下降优化节点掩码，寻找与原型最相似的连通子图。
+    使用可微掩码搜索与原型最相似的连通子图
     """
-    device = source_data.x.device
+    device = proto_graph_emb.device
     num_nodes = source_data.num_nodes
 
-    # 初始化：给一点随机噪声防止陷入鞍点
+    # 将目标向量从模型的计算图中分离，使其成为一个纯粹的“常量锚点”
+    # 这样 backward 只能影响 mask_logits，而不会尝试回传到模型参数
+    proto_graph_emb = proto_graph_emb.detach()
+
+    # 1. 初始化掩码参数 (使用 logits 形式)
     mask_logits = torch.nn.Parameter(torch.randn(num_nodes, device=device) * 0.1)
+    optimizer = torch.optim.Adam([mask_logits], lr=lr)
 
-    # 只优化 mask，冻结模型
-    optimizer = optim.Adam([mask_logits], lr=lr)
     model.eval()
-
-    # 目标原型嵌入 [1, d]
-    if proto_graph_emb.dim() == 1:
-        proto_graph_emb = proto_graph_emb.unsqueeze(0)
-    target = proto_graph_emb.detach()
-
     with torch.enable_grad():
         for i in range(iterations):
             optimizer.zero_grad()
 
+            # 2. 计算软掩码
             mask = torch.sigmoid(mask_logits)
 
-            # 将 mask 应用到特征
-            # 注意：source_data.x 不需要梯度，但 mask 需要，乘积 masked_x 会有梯度
-            masked_x = source_data.x * mask.view(-1, 1)
+            # 3. 构造加权特征 (Soft Masking)
+            # 这种方式让模型在优化时能感知到哪些节点是不需要的
+            x_weighted = source_data.x.to(device) * mask.unsqueeze(-1)
+            edge_index = source_data.edge_index.to(device)
+            batch = torch.zeros(num_nodes, dtype=torch.long, device=device)
 
-            # 构造临时数据
-            masked_data = source_data.clone()
-            masked_data.x = masked_x
-            if not hasattr(masked_data, "batch") or masked_data.batch is None:
-                masked_data.batch = torch.zeros(num_nodes, dtype=torch.long, device=device)
+            # 4. 通过模型 Encoder 获取当前掩码下的图嵌入
+            # 模拟 forward 过程，但使用加权后的特征
+            curr_x = x_weighted
+            for layer in model.gnn_layers:
+                curr_x = layer(curr_x, edge_index)
+                if model.emb_normalize:
+                    curr_x = F.normalize(curr_x, p=2, dim=-1)
+                curr_x = model.gnn_non_linear(curr_x)
 
-            # 前向传播
-            # 即使 model 在 eval 模式，只要输入 masked_x 有梯度，输出就会有梯度
-            _, _, _, current_graph_emb, _ = model(masked_data)
+            # Readout
+            pooled = []
+            for readout in model.readout_layers:
+                pooled.append(readout(curr_x, batch))
+            graph_emb = torch.cat(pooled, dim=-1)
 
-            # 计算 Loss
-            sim_loss = torch.nn.functional.mse_loss(current_graph_emb, target)
+            if model.emb_normalize:
+                graph_emb = F.normalize(graph_emb, p=2, dim=-1)
 
-            # L1 Loss: 推动 mask -> 0
-            size_loss = torch.mean(mask)
+            # 5. 计算 Loss
+            # 相似度损失 (假设使用余弦相似度，若模型用欧氏距离则改用 -dist)
+            similarity_val, _ = calculate_similarity(graph_emb, proto_graph_emb)
+            sim_loss = -similarity_val.mean()
 
-            # Entropy Loss: 推动 mask -> 0 或 1 (二值化)
-            # H = -p*log(p) - (1-p)*log(1-p)
-            entropy = -mask * torch.log(mask + 1e-8) - (1 - mask) * torch.log(1 - mask + 1e-8)
-            entropy_loss = entropy.mean()
+            # 稀疏性与熵正则
+            l1_loss = l1_reg * torch.sum(mask)
+            ent_loss = lambda_entropy * (
+                -torch.mean(mask * torch.log(mask + 1e-8) + (1 - mask) * torch.log(1 - mask + 1e-8)))
 
-            # 组合 Loss
-            loss = sim_loss + l1_reg * size_loss + lambda_entropy * entropy_loss
+            # 连通性约束
+            row, col = source_data.edge_index
+            conn_loss = lambda_conn * torch.mean((mask[row] - mask[col]) ** 2)
 
-            # 反向传播
-            loss.backward()
+            total_loss = sim_loss + l1_loss + ent_loss + conn_loss
+
+            total_loss.backward()
             optimizer.step()
 
-    # 3. 严格的连通性后处理
-    with torch.no_grad():
-        final_mask = torch.sigmoid(mask_logits)
 
-        # 1. 确定“种子”：Mask 值最大的那个节点，一定得选
-        best_node_idx = torch.argmax(final_mask).item()
+    # 6. 后处理：执行 Top-K + LCC
+    final_mask = torch.sigmoid(mask_logits)
+    best_sub_nodes = post_process_topk_lcc(final_mask, source_data, min_nodes, max_nodes)
 
-        # 2. 构建 NetworkX 图用于拓扑分析
-        G = to_networkx(source_data, to_undirected=True)
+    # 7. 计算最终 Hard 子图的相似度作为反馈
+    final_sim = 0.0
+    if best_sub_nodes is not None:
+        node_idx = torch.tensor(best_sub_nodes, dtype=torch.long, device=device)
+        sub_edge_index, _ = subgraph(node_idx, source_data.edge_index.to(device), relabel_nodes=True)
+        sub_data = Data(x=source_data.x.to(device)[node_idx], edge_index=sub_edge_index)
+        sub_data.batch = torch.zeros(sub_data.num_nodes, dtype=torch.long, device=device)
 
-        # 3. 广度优先搜索 (BFS) 扩展
-        # 从种子出发，优先访问 Mask 值高的邻居
-        # 只要节点数没到 max_nodes，且邻居的 Mask 值超过阈值，就加入
+        with torch.no_grad():
+            _, _, _, final_graph_emb, _ = model.forward(sub_data)
+            sim_val, _ = calculate_similarity(final_graph_emb, proto_graph_emb)
+            final_sim = sim_val.item()
 
-        selected_nodes = {best_node_idx}
-        candidates = []  # (mask_value, node_idx)
-
-        # 将种子的邻居加入候选队列
-        for neighbor in G.neighbors(best_node_idx):
-            candidates.append((final_mask[neighbor].item(), neighbor))
-
-        # 排序候选：Mask 值大的优先
-        candidates.sort(key=lambda x: x[0], reverse=True)
-
-        # 扩展循环
-        while len(selected_nodes) < max_nodes and candidates:
-            score, node = candidates.pop(0)  # 取出分数最高的
-
-            if node in selected_nodes:
-                continue
-
-            # 动态阈值：如果还没达到 min_nodes，门槛低一点；否则门槛高一点
-            threshold = 0.3 if len(selected_nodes) < min_nodes else 0.5
-
-            if score > threshold:
-                selected_nodes.add(node)
-                # 将新节点的邻居加入候选
-                new_neighbors = []
-                for nb in G.neighbors(node):
-                    if nb not in selected_nodes:
-                        new_neighbors.append((final_mask[nb].item(), nb))
-                # 重新排序 (简单起见，这里可以优化为优先队列)
-                candidates.extend(new_neighbors)
-                candidates.sort(key=lambda x: x[0], reverse=True)
-            else:
-                # 如果最高分的候选都不满足阈值，且已经满足最小节点数，提前退出
-                if len(selected_nodes) >= min_nodes:
-                    break
-
-        # 最终确认
-        final_node_indices = torch.tensor(list(selected_nodes), dtype=torch.long, device=device)
-        final_node_indices = torch.sort(final_node_indices)[0]
-
-        # 计算相似度返回
-        sub_edge_index, _ = subgraph(final_node_indices, source_data.edge_index, relabel_nodes=True)
-        final_data = Data(x=source_data.x[final_node_indices], edge_index=sub_edge_index)
-        final_data.batch = torch.zeros(final_data.num_nodes, dtype=torch.long, device=device)
-        _, _, _, final_emb, _ = model(final_data)
-        sim, _ = calculate_similarity(target, final_emb)
-
-        return set(final_node_indices.tolist()), float(sim.item())
+    return best_sub_nodes, final_sim

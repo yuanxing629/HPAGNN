@@ -10,6 +10,8 @@ import copy
 from torch_geometric.utils import subgraph
 import networkx as nx
 import numpy as np
+from sklearn.cluster import KMeans
+from sklearn.metrics import pairwise_distances_argmin_min
 
 
 # GIN
@@ -129,19 +131,18 @@ class GINNet(nn.Module):
             proto_graph_emb_list.append(g)
 
         proto_graph_emb = torch.stack(proto_graph_emb_list, dim=0)  # [C*m, d]
+
+        # 确保原型向量与图嵌入处于同一个单位球面空间
+        if self.emb_normalize:
+            proto_graph_emb = F.normalize(proto_graph_emb, p=2, dim=-1)
+
         return proto_graph_emb
 
     # 初始化原型
     @torch.no_grad()
     def initialize_prototypes(self, trainloader, classifier):
         """
-        使用预训练分类器，从训练集中为每一类选择 top-m 个高置信度整图，
-        然后从每个整图中提取紧凑连通子图作为初始化原型。
-        返回：
-          - init_proto_node_emb: List[Tensor (N_k, d)], 每个原型对应一个整图的所有节点嵌入
-          - init_proto_graph_emb: Tensor (P, d), P = C * m
-          - init_proto_graph_data: List[Data]，每个原型对应的原始图（PyG Data）
-          - info_dict: 一些计数 / 置信度信息
+        按类收集样本 -> 聚类 -> 选取最靠近簇中心的样本
         """
         device = self.device
         classifier.to(device)
@@ -150,13 +151,14 @@ class GINNet(nn.Module):
         m = self.num_prototypes_per_class
         num_classes = self.output_dim
 
-        # 每类样本： (graph_emb_full, node_emb_full, graph_data_full, conf_full)
-        correct_predictions = {c: [] for c in range(num_classes)}
-        all_samples = {c: [] for c in range(num_classes)}
+        # 分别存储预测正确和所有样本
+        correct_candidates = {c: [] for c in range(num_classes)}
+        all_candidates = {c: [] for c in range(num_classes)}
 
         for batch in trainloader:
             batch = batch.to(device)
             logits, probs, node_emb, graph_emb = classifier(batch)
+            print(probs)
 
             # graph_emb: [B, d], node_emb: [total_nodes_in_batch, d]
             data_list = batch.to_data_list()
@@ -164,56 +166,64 @@ class GINNet(nn.Module):
             probs_cpu = probs.detach().cpu()
             node_emb_cpu = node_emb.detach().cpu()
             graph_emb_cpu = graph_emb.detach().cpu()
-            batch_cpu = batch.batch.detach().cpu()
+            batch_indices = batch.batch.detach().cpu()
 
             for i, data_i in enumerate(data_list):
                 y_true = int(batch.y[i].item())
                 pred = int(probs_cpu[i].argmax().item())
                 conf = float(probs_cpu[i][y_true].item())
 
-                # 当前图的节点 mask
-                batch_mask = (batch_cpu == i)
-                current_node_emb = node_emb_cpu[batch_mask]  # [N_i, d]
-                current_graph_emb = graph_emb_cpu[i]  # [d]
+                # 提取当前图的节点嵌入
+                batch_mask = (batch_indices == i)
+                current_node_emb = node_emb_cpu[batch_mask]
+                current_graph_emb = graph_emb_cpu[i]
 
-                # 必须 Clone Data，否则后续会被覆盖
-                graph_data_i = data_i.clone()  # CPU Data
+                tup = {
+                    'graph_emb': current_graph_emb.clone(),
+                    'node_emb': current_node_emb.clone(),
+                    'graph_data': data_i.clone(),
+                    'conf': conf
+                }
 
-                tup = (
-                    current_graph_emb.clone(),  # graph_emb
-                    current_node_emb.clone(),  # node_emb
-                    graph_data_i,  # graph_data
-                    conf
-                )
-                all_samples[y_true].append(tup)
+                all_candidates[y_true].append(tup)
                 if pred == y_true:
-                    correct_predictions[y_true].append(tup)
+                    correct_candidates[y_true].append(tup)
 
-        selected_full_graphs = []
-        info_dict = {'final_selection': {c: 0 for c in range(num_classes)}}
+        selected_items = []
 
+        # 对每个类进行K-Means聚类
         for c in range(num_classes):
-            pool = correct_predictions[c]
+            # 策略：优先用预测正确的；若不够 m 个，退化到使用该类所有样本
+            pool = correct_candidates[c]
+            if len(pool) < m:
+                print(f"Warning: Class {c} has only {len(pool)} correct samples. Falling back to all samples.")
+                pool = all_candidates[c]
+
+            # 极端情况检查
             if len(pool) == 0:
-                # 如果这一类一个预测正确的都没有，就退化到 all_samples
-                pool = all_samples[c]
+                raise ValueError(f"Class {c} has NO samples in the training set!")
 
-            # 按置信度从高到低排序
-            pool_sorted = sorted(pool, key=lambda x: x[3], reverse=True)
+            # 聚类条件检查
+            if len(pool) >= m:
+                embeddings = np.array([item['graph_emb'] for item in pool])
+                if self.emb_normalize:
+                    # L2 归一化，确保 K-Means 是在“角度”上聚类
+                    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+                    embeddings = embeddings / (norms + 1e-9)
+                # 显式重塑为 2D 数组防止 sklearn 报错
+                if embeddings.ndim == 1:
+                    embeddings = embeddings.reshape(-1, 1)
 
-            chosen = []
-            while len(chosen) < m:
-                need = m - len(chosen)
-                if len(pool_sorted) == 0:
-                    break
-                if len(pool_sorted) >= need:
-                    chosen.extend(pool_sorted[:need])
-                else:
-                    chosen.extend(pool_sorted)  # 重复采样
-            chosen = chosen[:m]
-
-            info_dict['final_selection'][c] = len(chosen)
-            selected_full_graphs.extend([(c, item) for item in chosen])
+                kmeans = KMeans(n_clusters=m, random_state=42, n_init='auto').fit(embeddings)
+                closest, _ = pairwise_distances_argmin_min(kmeans.cluster_centers_, embeddings)
+                for idx in closest:
+                    selected_items.append((c, pool[idx]))
+            else:
+                # 样本数极少，无法聚类，直接循环选取
+                print(f"Warning: Class {c} sample size {len(pool)} < {m}. Using repetition.")
+                for k in range(m):
+                    idx = k % len(pool)
+                    selected_items.append((c, pool[idx]))
 
         # ---------- 对每个整图提连通子图，并重算 emb ----------
         init_proto_node_emb = []
@@ -222,14 +232,17 @@ class GINNet(nn.Module):
         init_proto_edge_list = []
         init_proto_in_which_graph = []
 
-        # [新增] 存储源图
+        #  存储源图
         self.prototype_source_graphs = []
-        init_subgraphs = []  # [新增] 用于存储子图，对应 prototype embedding 的结构
+        init_subgraphs = []  # 用于存储子图，对应 prototype embedding 的结构
 
-        for c, item in selected_full_graphs:
-            g_emb_full, n_emb_full, g_data_full, conf_full = item
+        for c, item in selected_items:  # 这里的 item 是字典
+            g_emb_full = item['graph_emb']
+            n_emb_full = item['node_emb']
+            g_data_full = item['graph_data']
+            conf_full = item['conf']
 
-            # [重要] 保存源图，供后续 Search 使用
+            #  保存源图，供后续 Search 使用
             self.prototype_source_graphs.append(g_data_full)
 
             # 临时启用梯度计算
@@ -244,7 +257,7 @@ class GINNet(nn.Module):
                     return_info=True,
                 )
 
-            # [关键修正] 保存子图结构，供 Generate 阶段计算 A_init 使用
+            # 保存子图结构，供 Generate 阶段计算 A_init 使用
             # sub_data 的 edge_index 已经是 relabel 过的 [0, N_sub-1]
             init_subgraphs.append(sub_data.detach().cpu())
 
@@ -277,7 +290,7 @@ class GINNet(nn.Module):
             for t in init_proto_node_emb
         ])
 
-        # [修改] 使用 anchor_graph_emb 作为动态目标，而不是固定的 init
+        #  使用 anchor_graph_emb 作为动态目标，而不是固定的 init
         if hasattr(self, "anchor_graph_emb"):
             self.anchor_graph_emb = init_proto_graph_emb.clone().detach()
         else:
@@ -288,17 +301,14 @@ class GINNet(nn.Module):
         else:
             self.register_buffer("init_proto_graph_emb", init_proto_graph_emb.clone().detach())
 
-        # [关键修正] init_proto_graphs 必须存子图，否则 generate 阶段 A_init 索引越界
         self.init_proto_graphs = init_subgraphs
 
         self.init_proto_node_list = init_proto_node_list
         self.init_proto_edge_list = init_proto_edge_list
-        self.init_info_dict = info_dict
 
-        return init_proto_node_emb, init_proto_graph_emb, init_proto_node_list, init_proto_edge_list, init_proto_in_which_graph, info_dict
+        return init_proto_node_emb, init_proto_graph_emb, init_proto_node_list, init_proto_edge_list, init_proto_in_which_graph
 
     #  动态锚点更新函数
-    @torch.no_grad()
     def update_prototype_anchors(self, momentum=0.6):
         """
         混合机制的核心：使用可微掩码优化 (Differentiable Mask Optimization) 更新 anchor
@@ -307,7 +317,8 @@ class GINNet(nn.Module):
         self.eval()
 
         # 当前学习到的原型图向量
-        current_proto_graph_embs = self.proto_node_emb_2_graph_emb()  # [P, d]
+        with torch.no_grad():
+            current_proto_graph_embs = self.proto_node_emb_2_graph_emb()  # [P, d]
 
         new_anchor_embs = []
 
@@ -329,8 +340,9 @@ class GINNet(nn.Module):
                 max_nodes=self.max_nodes,
                 iterations=50,  # 迭代次数，50次通常足够收敛
                 lr=0.05,  # 学习率
-                l1_reg=0.05,  # 稀疏正则权重，可根据效果微调
-                lambda_entropy=0.1  # 熵正则权重
+                l1_reg=0.01,  # 稀疏正则权重，可根据效果微调
+                lambda_entropy=0.01,  # 熵正则权重
+                lambda_conn=0.1
             )
 
             if best_nodes is not None and len(best_nodes) > 0:
@@ -362,11 +374,7 @@ class GINNet(nn.Module):
     @torch.no_grad()
     def refresh_and_update_anchors(self, trainloader, top_k_ratio=0.2):
         """
-        动态源图更新与锚点投影：
-        1. 遍历 trainloader，计算当前模型对所有样本的置信度。
-        2. 对每个类别，筛选出预测正确且置信度最高的 Top-K% 样本（至少 m 个）。
-        3. 更新 self.prototype_source_graphs 为这些新的高质量样本。
-        4. 在这些新源图上执行 Beam Search，更新 anchor_graph_emb。
+        动态源图更新与锚点投影
         """
         was_training = self.training
         self.eval()
@@ -375,82 +383,50 @@ class GINNet(nn.Module):
         m = self.num_prototypes_per_class
         num_classes = self.output_dim
 
-        # 1. 收集所有样本的置信度信息
-        # 结构: {class_idx: [(graph_data, confidence), ...]}
-        candidates = {c: [] for c in range(num_classes)}
-
-        # 为了避免占用过多显存，我们在循环中处理，并把 data 移回 CPU 暂存
+        # 1. 收集当前模型预测正确的样本及其嵌入
+        class_samples = {c: [] for c in range(num_classes)}
         for batch in trainloader:
             batch = batch.to(device)
-            # 使用当前模型进行预测
-            # _, probs, _, _ = classifier_forward_pass(self, batch) # 辅助函数或直接 forward
-            # # 这里直接调用 forward 即可，只需要 probs
-            _, probs, _, _, _ = self.forward(batch)
+            _, probs, _, graph_emb, _ = self.forward(batch)
 
             probs_cpu = probs.detach().cpu()
+            emb_cpu = graph_emb.detach().cpu().numpy()
             data_list = batch.to_data_list()
 
             for i, data in enumerate(data_list):
                 y_true = int(data.y.item())
-                pred_cls = int(probs_cpu[i].argmax().item())
-                conf = float(probs_cpu[i][y_true].item())
+                pred = int(probs_cpu[i].argmax().item())
+                if pred == y_true:
+                    class_samples[y_true].append({
+                        'data': data.clone().cpu(),
+                        'emb': emb_cpu[i]
+                    })
 
-                # 只保留预测正确的样本
-                if pred_cls == y_true:
-                    # 将 data 移回 CPU 以节省显存，clone 以防被后续操作修改
-                    data_cpu = data.clone().cpu()
-                    candidates[y_true].append((data_cpu, conf))
-
-        # 2. 筛选 Top-K% 并更新源图池
-        new_source_graphs = []  # 扁平化列表，长度应为 num_classes * m
-        # 我们需要保持原型索引的顺序：Class 0 (0..m-1), Class 1 (m..2m-1)...
-
-        # 临时的列表，用于按顺序存放每个原型的源图
+        # 2. 聚类更新源图池
         ordered_source_graphs = [None] * (num_classes * m)
-
         for c in range(num_classes):
-            pool = candidates[c]
-            # 按置信度降序排列
-            pool.sort(key=lambda x: x[1], reverse=True)
-
-            total_correct = len(pool)
-            if total_correct == 0:
-                # 极端情况：该类没有预测正确的样本。
-                # 策略：保留旧的源图，或者从所有样本中选（这里暂且跳过更新，保留旧的）
-                print(f"Warning: Class {c} has no correct predictions. Keeping old source graphs.")
-                # 填回旧的源图
+            pool = class_samples[c]
+            # 如果当前模型对该类全预测错了，保留旧的源图，不进行更新
+            if len(pool) < m:
+                # 降级处理：若正确样本不足，保留旧源图
                 start_idx = c * m
                 for k in range(m):
                     ordered_source_graphs[start_idx + k] = self.prototype_source_graphs[start_idx + k]
                 continue
 
-            # 计算截断阈值
-            cutoff_num = int(total_correct * top_k_ratio)
-            # 保证至少取 m 个（如果总数够的话）
-            num_to_select = max(cutoff_num, m)
-            # 如果总数连 m 个都不够，就取全部
-            num_to_select = min(num_to_select, total_correct)
+            # 对预测正确的样本进行聚类
+            embeddings = np.array([s['emb'] for s in pool])
+            kmeans = KMeans(n_clusters=m, random_state=42, n_init='auto').fit(embeddings)
 
-            # Top Pool
-            top_pool = pool[:num_to_select]
+            # 获取最靠近 m 个簇中心的真实样本
+            closest, _ = pairwise_distances_argmin_min(kmeans.cluster_centers_, embeddings)
 
-            # 3. 为该类别的 m 个原型分配源图
-            # 策略：从 Top Pool 中轮询分配，或者是随机采样分配，保证多样性
-            # 这里采用简单轮询：确保最好的图被用到
-            for k in range(m):
-                # 循环取样，确保填满 m 个
-                sample_idx = k % len(top_pool)
-                source_data = top_pool[sample_idx][0]  # 取出 Data 对象
-
+            for k, sample_idx in enumerate(closest):
                 global_proto_idx = c * m + k
-                ordered_source_graphs[global_proto_idx] = source_data
+                ordered_source_graphs[global_proto_idx] = pool[sample_idx]['data']
 
-        # 更新成员变量
+        # 3.更新成员变量并执行锚点投影
         self.prototype_source_graphs = ordered_source_graphs
-        # print(f"Source graphs refreshed using Top-{top_k_ratio*100}% high confidence samples.")
-
-        # 4. 立即基于新源图执行 Beam Search 更新锚点
-        # 复用已有的 update_prototype_anchors 函数
         self.update_prototype_anchors(momentum=0.5)
 
         if was_training:
@@ -490,6 +466,11 @@ class GINNet(nn.Module):
         for readout in self.readout_layers:
             pooled.append(readout(x, batch))
         x = torch.cat(pooled, dim=-1)
+
+        # 如果开启了归一化，确保图级嵌入也是单位模长
+        if self.emb_normalize:
+            x = F.normalize(x, p=2, dim=-1)
+
         graph_emb = x
 
         similarity, min_distances = self.prototype_distances(x)

@@ -7,7 +7,7 @@ class DataParser:
     def __init__(self):
         super(DataParser, self).__init__()
         self.dataset_dir = './datasets'
-        self.dataset_name = 'BA_2Motifs'
+        self.dataset_name = 'MUTAG'
         self.task = None
         self.random_split: bool = True
         self.data_split_ratio: List = [0.8, 0.1, 0.1]
@@ -27,15 +27,15 @@ class ModelParser:
         self.dropout: float = 0.5  # the dropout after mlp layers
 
         self.adj_normalize: bool = True  # the edge_weight normalization for gcn conv
-        self.emb_normalize: bool = False  # the l2 normalization after gnn layer
+        self.emb_normalize: bool = True  # the l2 normalization after gnn layer
 
         self.num_prototypes_per_class = 5
 
         # 搜索的图节点控制
         self.min_nodes: int = 5
-        self.max_nodes: int = 6
+        self.max_nodes: int = 9
 
-        self.max_gen_nodes = 5
+        self.max_gen_nodes = 9
 
         # GAT
         self.gat_dropout = 0.6  # dropout in gat layer
@@ -55,7 +55,7 @@ class TrainParser:
     def __init__(self):
         super(TrainParser, self).__init__()
         self.learning_rate: float = 5e-3  # 0.005
-        self.batch_size: int = 24
+        self.batch_size: int = 32
         self.weight_decay: float = 0.0
         self.max_epochs: int = 300
         self.save_epoch = 20

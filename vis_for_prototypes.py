@@ -171,7 +171,7 @@ def run_visualization():
         weights_only=False)
     classifier.update_state_dict(pretrain_ckpt['net'])
     (init_proto_node_emb, init_proto_graph_emb, init_proto_node_list,
-     init_proto_edge_list, init_proto_in_which_graph, info_dict) = gnnNets.model.initialize_prototypes(
+     init_proto_edge_list, init_proto_in_which_graph) = gnnNets.model.initialize_prototypes(
         trainloader=dataloader['train'], classifier=classifier)
     if hasattr(gnnNets.model, 'init_proto_node_list') and gnnNets.model.init_proto_node_list:
         node_list_fmt = [tensor_to_list_int(n) for n in gnnNets.model.init_proto_node_list]

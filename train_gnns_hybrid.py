@@ -95,7 +95,7 @@ def train_GC():
     gnnNets.to_device()
 
     # initialization
-    print("Performing Prototype Initialization (based on high-confidence samples)...")
+    print("Performing Prototype Initialization...")
     # 预训练的分类器给出了置信度得分
     classifier = GnnClassifier(input_dim, output_dim, model_args)
     classifier.to_device()
@@ -107,22 +107,22 @@ def train_GC():
     start_time = time.time()
 
     (init_proto_node_emb, init_proto_graph_emb, init_proto_node_list,
-     init_proto_edge_list, init_proto_in_which_graph, info_dict) = gnnNets.model.initialize_prototypes(
+     init_proto_edge_list, init_proto_in_which_graph) = gnnNets.model.initialize_prototypes(
         trainloader=dataloader['train'], classifier=classifier)
 
     # 初始可视化（可选）
-    init_vis_dir = os.path.join("checkpoint", data_args.dataset_name, "init_prot")
+    # init_vis_dir = os.path.join("checkpoint", data_args.dataset_name, "init_prot")
     # print(init_proto_node_list)
     # print(init_proto_edge_list)
-    plotter = PlotUtils(dataset_name=data_args.dataset_name)
-    visualize_init_prototypes(
-        nodelist=init_proto_node_list,
-        edgelist=init_proto_edge_list,
-        num_prototypes_per_class=model_args.num_prototypes_per_class,
-        graph_data=init_proto_in_which_graph,  # 保存的原始 Data 列表
-        plotter=plotter,
-        out_dir=init_vis_dir
-    )
+    # plotter = PlotUtils(dataset_name=data_args.dataset_name)
+    # visualize_init_prototypes(
+    #     nodelist=init_proto_node_list,
+    #     edgelist=init_proto_edge_list,
+    #     num_prototypes_per_class=model_args.num_prototypes_per_class,
+    #     graph_data=init_proto_in_which_graph,  # 保存的原始 Data 列表
+    #     plotter=plotter,
+    #     out_dir=init_vis_dir
+    # )
 
     ckpt_dir = f"./checkpoint/{data_args.dataset_name}/"
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -162,7 +162,7 @@ def train_GC():
 
         # [新增] 周期性动态锚点更新 (Hybrid Mechanism Core)
         if epoch >= train_args.proj_epochs and epoch % 20 == 0:
-            print(f"Epoch {epoch}: Refreshing source pool (Top-20%) and updating anchors...")
+            print(f"Epoch {epoch}: Refreshing source pool and updating anchors...")
 
             # 调用新函数：同时完成筛选源图 + Beam Search + 更新 Anchor
             # 传入 dataloader['train'] 用于全量评估
@@ -268,7 +268,7 @@ def train_GC():
     append_record(f"Test loss: {test_state['loss']:.3f}, acc: {test_state['acc']:.3f}")
     append_record('-' * 100)
 
-    run_explanation_metrics(gnnNets, dataloader,model_args)
+    run_explanation_metrics(gnnNets,model_args)
 
 
 
@@ -308,28 +308,16 @@ def test_GC(test_dataloader, gnnNets, criterion):
     return test_state, pred_probs, predictions
 
 
-def run_explanation_metrics(gnnNets, dataloader, model_args):
+def run_explanation_metrics(gnnNets, model_args):
     print("\n" + "=" * 30)
     print("Running Explanation Metrics...")
     print("=" * 30)
 
     evaluator = ExplanationEvaluator(gnnNets.model, model_args)
 
-    # 1. 计算 Silhouette Score (原型质量)
+    # 计算 Silhouette Score (原型质量)
     sil_score = evaluator.evaluate_silhouette()
     print(f"Prototype Silhouette Score: {sil_score:.4f} ↑")
-
-    # 2. 计算 Fidelity (解释忠实度)
-    # 使用 test dataloader
-    # test_dataset = dataloader["test"].dataset
-    # fidelity_metrics = evaluator.evaluate_fidelity(test_dataset, num_samples=len(test_dataset))
-    # print(f"Fidelity+ (Occlusion): {fidelity_metrics['fidelity_plus']:.4f} ↑")
-    # print(f"Fidelity- (Sparsity) : {fidelity_metrics['fidelity_minus']:.4f} ↓")
-
-    # 3. AUC (仅当数据集有 GT 时)
-    # auc_score = evaluator.evaluate_auc(test_dataset)
-    # if auc_score:
-    #     print(f"Explanation AUC: {auc_score:.4f}")
 
     print("=" * 30 + "\n")
 # -----------------------------
