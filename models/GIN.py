@@ -5,13 +5,14 @@ from torch_geometric.nn.conv import GINConv
 from torch_geometric.data import Data, Batch
 from my_search import differentiable_search_subgraph
 from models.model_utils import get_readout_layers
-from my_init import extract_connected_subgraph, extract_connected_subgraph2
+from my_init import extract_connected_subgraph2
 import copy
 from torch_geometric.utils import subgraph
 import networkx as nx
 import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.metrics import pairwise_distances_argmin_min
+from torch_geometric.utils import negative_sampling
 
 
 # GIN
@@ -50,6 +51,7 @@ class GINNet(nn.Module):
             )
 
         self.gnn_non_linear = nn.ReLU()
+        self.dropout_rate = 0.5
 
         self.Softmax = nn.Softmax(dim=-1)
         self.mlp_non_linear = nn.ELU()
@@ -61,8 +63,6 @@ class GINNet(nn.Module):
 
         self.num_prototypes_per_class = model_args.num_prototypes_per_class
 
-        # 先初始化为随机，后续用 initialize_prototypes_based_on_confidence来进行初始化
-        # 只指定prototype_node_emb，图嵌入通过READOUT来算出
         self.num_prototypes = self.prototype_shape[0]
 
         self.last_layer = nn.Linear(self.num_prototypes, output_dim,
@@ -76,6 +76,13 @@ class GINNet(nn.Module):
         for j in range(self.num_prototypes):
             self.prototype_class_identity[j, j // model_args.num_prototypes_per_class] = 1
 
+        self.min_nodes = model_args.min_nodes
+        self.max_nodes = model_args.max_nodes
+
+        # 生成候选的存储
+        self.generated_candidates = None  # 生成候选
+        self.max_gen_nodes = model_args.max_gen_nodes
+
         # used for graph_decoder
         self.node_mlp = nn.Sequential(
             nn.Linear(self.proto_dim, self.dense_dim, bias=True),
@@ -84,10 +91,6 @@ class GINNet(nn.Module):
         )
         # 内积解码的可学习缩放
         self.logit_scale = nn.Parameter(torch.tensor(1.0))
-
-        # 生成候选的存储
-        self.generated_candidates = None  # 生成候选
-        self.max_gen_nodes = model_args.max_gen_nodes
 
         # initialize the last layer
         self.set_last_layer_incorrect_connection(incorrect_strength=-0.5)
@@ -101,17 +104,12 @@ class GINNet(nn.Module):
         # [修改] init_proto_graphs 仅用于记录最开始的状态，实际运算使用 source graphs
         self.init_proto_graphs = None
 
-        # self.init_proto_graphs = None
-        # self.init_proto_selection_info = None
         self.init_proto_node_list = None
         self.init_proto_edge_list = None
-        # self.init_proto_in_which_graph = None
+
         self.init_info_dict = None
         self.anchor_graph_emb = None
         self.init_proto_graph_emb = None
-
-        self.min_nodes = model_args.min_nodes
-        self.max_nodes = model_args.max_nodes
 
     def proto_node_emb_2_graph_emb(self):
         """
@@ -158,7 +156,7 @@ class GINNet(nn.Module):
         for batch in trainloader:
             batch = batch.to(device)
             logits, probs, node_emb, graph_emb = classifier(batch)
-            print(probs)
+            # print(probs)
 
             # graph_emb: [B, d], node_emb: [total_nodes_in_batch, d]
             data_list = batch.to_data_list()
@@ -252,7 +250,6 @@ class GINNet(nn.Module):
                     g_data_full,
                     classifier,
                     target_class=c,
-                    min_nodes=self.min_nodes,
                     max_nodes=self.max_nodes,
                     return_info=True,
                 )
@@ -336,9 +333,8 @@ class GINNet(nn.Module):
                 proto_graph_emb=target_vec,
                 source_data=source_graph,  # 直接传 data，因为需要 x 和 edge_index
                 model=self,
-                min_nodes=self.min_nodes,
                 max_nodes=self.max_nodes,
-                iterations=50,  # 迭代次数，50次通常足够收敛
+                iterations=50,  # 迭代次数
                 lr=0.05,  # 学习率
                 l1_reg=0.01,  # 稀疏正则权重，可根据效果微调
                 lambda_entropy=0.01,  # 熵正则权重
@@ -460,6 +456,7 @@ class GINNet(nn.Module):
             if self.emb_normalize:
                 x = F.normalize(x, p=2, dim=-1)
             x = self.gnn_non_linear(x)
+            x = F.dropout(x, p=self.dropout_rate, training=self.training)
 
         node_emb = x
         pooled = []
@@ -477,86 +474,6 @@ class GINNet(nn.Module):
         logits = self.last_layer(similarity)
         probs = self.Softmax(logits)
         return logits, probs, node_emb, graph_emb, min_distances
-
-    @torch.no_grad()
-    def search_prototype_subgraphs(self, trainloader, min_nodes: int, max_nodes: int):
-        """
-        对当前模型学到的每个原型， 在训练集的真实图上搜索与其图级嵌入最相似的真实子图
-        (min_nodes <= 子图节点数 <= max_nodes)。
-
-        返回：
-          best_node_list: List[P]，best_node_list[p] 是 Tensor[ num_nodes_sub_p ]
-                          表示该原型对应子图在那张图里的节点编号（相对那张 Data，从 0 开始）
-          best_edge_list: List[P]，best_edge_list[p] 是 LongTensor[2, E_sub_p]，子图的边列表
-          best_sim_list:  List[P]，best_sim_list[p] 是 float，相似度
-          best_graph_idx_list
-        """
-        # 保持不变，用于最终可视化
-        device = self.device
-        self.eval()
-
-        # 当前原型的图级嵌入 [P, d]
-        proto_graph_emb = self.proto_node_emb_2_graph_emb()  # 你已有的函数
-        num_prototypes = proto_graph_emb.size(0)
-
-        # 初始化最优解
-        best_node_list = [None for _ in range(num_prototypes)]
-        best_edge_list = [None for _ in range(num_prototypes)]
-        best_sim_list = [float("-inf") for _ in range(num_prototypes)]
-        best_graph_idx_list = [None for _ in range(num_prototypes)]
-        global_graph_idx = 0
-
-        for batch in trainloader:
-            batch = batch.to(device)
-            logits, probs, node_emb, graph_emb, _ = self.forward(batch)
-
-            data_list = batch.to_data_list()
-            # node_emb: [sum_i N_i, d]，data_list 里每个 Data 的节点是 0..N_i-1
-            cursor = 0
-            for data in data_list:
-                N = data.num_nodes
-                node_emb_g = node_emb[cursor:cursor + N]  # [N, d]
-                cursor += N
-
-                edge_index_g = data.edge_index.to(device)  # [2, E]，节点编号 0..N-1
-                x_g = data.x.to(device)
-
-                # 对每个原型，在这张图上跑一次搜索
-                for p_idx in range(num_prototypes):
-                    proto_emb_p = proto_graph_emb[p_idx]  # [d]
-
-                    temp_data = Data(x=data.x.to(device), edge_index=data.edge_index.to(device))
-                    temp_data.batch = torch.zeros(temp_data.num_nodes, dtype=torch.long, device=device)
-
-                    sub_nodes, sub_sim = differentiable_search_subgraph(
-                        proto_graph_emb=proto_emb_p,
-                        source_data=temp_data,
-                        model=self,
-                        min_nodes=min_nodes,
-                        max_nodes=max_nodes,
-                        iterations=100,  # 推理阶段可以用更多迭代
-                        lr=0.05
-                    )
-                    if sub_nodes is None:
-                        continue
-
-                    if sub_sim > best_sim_list[p_idx]:
-                        best_sim_list[p_idx] = sub_sim
-                        # sub_nodes 是 set[int]，转 Tensor 并排序一下
-                        node_idx = torch.tensor(sorted(list(sub_nodes)), dtype=torch.long)
-
-                        # 构造子图边：选两端都在 node_idx 的边
-                        node_mask = torch.zeros(N, dtype=torch.bool, device=device)
-                        node_mask[node_idx] = True
-                        mask_edge = node_mask[edge_index_g[0]] & node_mask[edge_index_g[1]]
-                        sub_edge_index = edge_index_g[:, mask_edge].detach().cpu()  # 保留原图节点编号
-
-                        best_node_list[p_idx] = node_idx.detach().cpu()
-                        best_edge_list[p_idx] = sub_edge_index
-                        best_graph_idx_list[p_idx] = global_graph_idx
-                global_graph_idx += 1
-
-        return best_node_list, best_edge_list, best_sim_list, best_graph_idx_list
 
     @staticmethod
     def _sym_clean(A, symmetric=True, remove_self_loops=True):
@@ -638,28 +555,25 @@ class GINNet(nn.Module):
     # 在训练后生成原型图+可视化
     def generate_candidate_prototypes(self, threshold: float = 0.9):
         """
-        [策略升级] 基于锚点的生成式细化 (Anchor-based Generative Refinement)
-        不再凭空生成，而是利用 Search Branch 找到的源图作为骨架，
-        生成分支学习一个 Attention/Mask 来“提纯”这个骨架。
+        基于图级原型向量的生成式细化 (Vector-based Generative Refinement)
+        功能：将抽象的原型向量转化为具体的图结构 Data 对象并缓存。
         """
         device = self.device
         candidate_embeddings = []
         candidate_node_features = []
         candidate_graph_data = []
 
+        # 记录原始状态，通常在训练循环中调用时需要切回 eval 模式以保证生成质量
         was_training = self.training
         self.eval()
 
-        with torch.no_grad():
+        with torch.no_grad():  # 生成结构的过程不需要保存中间梯度
             for p_idx in range(self.num_prototypes):
                 # 1. 获取对应的源图 (来自 Search Branch 的成果)
-                # 注意：self.prototype_source_graphs 是 Data 对象列表
                 source_data = self.prototype_source_graphs[p_idx].to(device)
 
                 # 2. 获取当前原型的 Embedding
                 proto_vec = self.prototype_node_emb[p_idx]  # [N_k, d] (这是以前的可学习参数)
-                # 或者使用图级嵌入
-                # proto_vec = self.proto_node_emb_2_graph_emb()[p_idx] # [d]
 
                 # 3. 这里的关键逻辑：
                 # 我们不再用 proto_vec 解码出 N*N 矩阵。
@@ -678,19 +592,6 @@ class GINNet(nn.Module):
 
                 # 此时 x_src 是 [N_src, 128]，可以喂给 decoder 了
                 node_emb_src = x_src
-
-                # 如果 Search Branch 已经找到过一个最优子图索引，我们应该基于那个子图做细化
-                # 如果没有记录，就基于全图做 (这里假设基于全图，或者你可以存下 best_node_list)
-
-                # 计算节点重要性分数 (Refinement Score)
-                # 简单做法：计算源图节点与原型嵌入的相似度
-                # 假设 proto_vec 是图级嵌入 [d]
-                # scores = torch.matmul(x_src, proto_vec.unsqueeze(1)).squeeze() # [N_src]
-                # scores = torch.sigmoid(scores)
-
-                # 高级做法 (使用你现有的 decoder MLP):
-                # 我们把源图的节点特征视为 p_i，输入 node_mlp 得到重构特征
-                # 然后计算边概率，但只保留 edge_index 中存在的边！
 
                 # 使用源图特征进行解码
                 decoder_out = self.graph_decoder(node_emb_src)
@@ -770,7 +671,7 @@ class GINNet(nn.Module):
     # 计算重构损失
     def reconstruction_loss(self, batch_data=None):
         """
-        [修正] 引入自编码任务 (Auto-Encoder Task)
+        引入自编码任务 (Auto-Encoder Task)
         使用当前的 Graph Decoder 重构输入的真实 Batch 数据。
         这教会生成器什么是“合理的图结构”。
         """
@@ -797,28 +698,18 @@ class GINNet(nn.Module):
         # 为了效率，我们只采样一部分边，或者只对每个子图内部做解码
         # 简单起见，利用 PyG 的 batch 属性，只计算同一图内部的边概率
 
-        decoder_out = self.graph_decoder(real_node_emb)
-        edge_logits = decoder_out['edge_logits']  # 注意：这里 graph_decoder 假设输入是 [B, N, d]
+        # decoder_out = self.graph_decoder(real_node_emb)
+        # edge_logits = decoder_out['edge_logits']  # 注意：这里 graph_decoder 假设输入是 [B, N, d]
 
-        # !重要修正!：你的 graph_decoder 实现是针对 [B, N, d] 的 (原型是这样的)。
-        # 但这里的 real_node_emb 是 [Total_Nodes, d] (PyG 格式)。
-        # 我们需要适配一下 graph_decoder 或者在这里手写一个内积解码
-
-        # --- 手写适配 PyG Batch 的解码 ---
         node_feats = self.node_mlp(real_node_emb)  # [Total_Nodes, d_out]
 
         # 为了计算 BCE，我们需要正样本（存在的边）和负样本（不存在的边）
-
         # 正样本：batch_data.edge_index
         src, dst = batch_data.edge_index
         pos_score = (node_feats[src] * node_feats[dst]).sum(dim=-1) * self.logit_scale
         pos_loss = -F.logsigmoid(pos_score).mean()
 
         # 负样本：随机采样
-        neg_src = torch.randint(0, batch_data.num_nodes, (src.size(0),), device=self.device)
-        neg_dst = torch.randint(0, batch_data.num_nodes, (src.size(0),), device=self.device)
-        # (简单采样，不严格排除正样本，在大图中影响不大；严格做法需用 negative_sampling)
-        from torch_geometric.utils import negative_sampling
         neg_edge_index = negative_sampling(edge_index, num_nodes=batch_data.num_nodes)
 
         neg_src, neg_dst = neg_edge_index

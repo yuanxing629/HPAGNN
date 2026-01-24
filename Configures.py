@@ -7,7 +7,7 @@ class DataParser:
     def __init__(self):
         super(DataParser, self).__init__()
         self.dataset_dir = './datasets'
-        self.dataset_name = 'MUTAG'
+        self.dataset_name = 'BA_2Motifs'
         self.task = None
         self.random_split: bool = True
         self.data_split_ratio: List = [0.8, 0.1, 0.1]
@@ -56,7 +56,7 @@ class TrainParser:
         super(TrainParser, self).__init__()
         self.learning_rate: float = 5e-3  # 0.005
         self.batch_size: int = 32
-        self.weight_decay: float = 0.0
+        self.weight_decay: float = 1e-3
         self.max_epochs: int = 300
         self.save_epoch = 20
         self.early_stopping = 10000
@@ -76,7 +76,7 @@ class TrainParser:
         self.lambda_proto = 0.5  # 约束原型学习过程，使其靠近初始化的原型
         self.lambda_rec = 0.005  # 重构损失
         self.lambda_align = 0.1  # 约束生成的原型靠近学到的原型
-        self.lambda_div = 0.1  # 防止同类原型过于接近
+        self.lambda_div = 0.01  # 防止同类原型过于接近
 
 
 data_args = DataParser()

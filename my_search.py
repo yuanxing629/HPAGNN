@@ -25,7 +25,7 @@ def calculate_similarity(graph_emb1, graph_emb2):
     return similarity, distance
 
 
-def post_process_topk_lcc(mask_values, source_data, min_nodes, max_nodes):
+def post_process_topk_lcc(mask_values, source_data, max_nodes):
     """
     后处理策略：选取 Mask 最高的节点，提取诱导子图，保留其中的最大连通分量 (LCC)
     """
@@ -55,7 +55,6 @@ def differentiable_search_subgraph(
         proto_graph_emb,
         source_data,
         model,
-        min_nodes=3,
         max_nodes=10,
         iterations=50,
         lr=0.05,
@@ -131,7 +130,7 @@ def differentiable_search_subgraph(
 
     # 6. 后处理：执行 Top-K + LCC
     final_mask = torch.sigmoid(mask_logits)
-    best_sub_nodes = post_process_topk_lcc(final_mask, source_data, min_nodes, max_nodes)
+    best_sub_nodes = post_process_topk_lcc(final_mask, source_data, max_nodes)
 
     # 7. 计算最终 Hard 子图的相似度作为反馈
     final_sim = 0.0

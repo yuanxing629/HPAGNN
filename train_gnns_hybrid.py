@@ -160,7 +160,7 @@ def train_GC():
         align_loss_list = []  # 约束生成的原型
         div_loss_list = []  # 防止同类原型过于相似
 
-        # [新增] 周期性动态锚点更新 (Hybrid Mechanism Core)
+        # 周期性动态锚点更新 (Hybrid Mechanism Core)
         if epoch >= train_args.proj_epochs and epoch % 20 == 0:
             print(f"Epoch {epoch}: Refreshing source pool and updating anchors...")
 
@@ -171,11 +171,9 @@ def train_GC():
                 top_k_ratio=0.2
             )
 
-        # 每个 Epoch 开始时清空一次，强制 alignment_loss 在本 Epoch 第一个 Batch 时生成一次
-        # 随后的 Batch 将直接复用，不再运行 NetworkX
-        gnnNets.model.generated_candidates = None
-
         gnnNets.train()
+        # 每个 Epoch 开始时清空一次，强制 alignment_loss 在本 Epoch 第一个 Batch 时生成一次
+        gnnNets.model.generated_candidates = None
         if epoch < train_args.warm_epochs:
             warm_only(gnnNets)
         else:

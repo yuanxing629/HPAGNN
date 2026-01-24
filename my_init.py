@@ -5,193 +5,10 @@ from torch_geometric.utils import subgraph, to_networkx,to_dense_adj
 import networkx as nx
 
 
-@torch.no_grad()
-def extract_connected_subgraph(
-        graph: Data,
-        model,  # 预训练的classifier
-        target_class: int = None,
-        min_nodes: int = 6,
-        max_nodes: int = 12,
-        use_occlusion: bool = True,
-        conf_keep_ratio: float = 0.95,
-        auto_expand: bool = True,
-        expand_step: int = 5,
-        return_info: bool = False,
-        verbose_cc: bool = False,  # 是否打印 CC 尺寸变化
-):
-    model.eval()
-    device = next(model.parameters()).device
-    g = graph.to(device)
-
-    if not hasattr(g, "batch") or g.batch is None:
-        g.batch = torch.zeros(g.num_nodes, dtype=torch.long, device=device)
-
-    # 原始预测
-    logits, probs, node_emb, graph_emb = model(g)
-    if target_class is None:
-        target_class = int(logits.argmax(dim=-1).item())
-    original_conf = float(probs[0, target_class].item())
-    threshold = conf_keep_ratio * original_conf
-
-    # 重要性：cos + occlusion
-    node_importance = F.cosine_similarity(node_emb, graph_emb, dim=-1)
-
-    if use_occlusion:
-        occlusion_drop = torch.zeros(g.num_nodes, device=device)
-        for i in range(g.num_nodes):
-            mask = torch.ones(g.num_nodes, dtype=torch.bool, device=device)
-            mask[i] = False
-            sub_edge_index, _ = subgraph(mask, g.edge_index, relabel_nodes=True)
-            if mask.sum().item() == 0:
-                continue
-            temp_batch = torch.zeros(mask.sum().item(), dtype=torch.long, device=device)
-            temp_data = Data(x=g.x[mask], edge_index=sub_edge_index, batch=temp_batch).to(device)
-            _, temp_probs, _, _ = model(temp_data)
-            conf = float(temp_probs[0, target_class].item())
-            occlusion_drop[i] = original_conf - conf
-
-        occlusion_drop = torch.clamp(occlusion_drop, min=0.0)
-        final_importance = node_importance + 0.8 * occlusion_drop
-    else:
-        final_importance = node_importance
-
-    sorted_nodes = torch.argsort(final_importance.detach().cpu(), descending=True).tolist()
-    N = len(sorted_nodes)
-
-    min_nodes = max(1, min_nodes)
-    max_nodes = min(max_nodes, N)
-
-    expanded_times = 0
-    current_max = max_nodes
-
-    # 全局兜底（记录“连通子图”上的最好 conf）
-    best_cc_data = None
-    best_cc_topk_nodes = None
-    best_cc_conf = -1.0
-
-    def build_topk_sub(topk_nodes):
-        sub_edge_index, _ = subgraph(topk_nodes, g.edge_index, relabel_nodes=True)
-        sub_batch = torch.zeros(topk_nodes.size(0), dtype=torch.long, device=device)
-        sub_data = Data(x=g.x[topk_nodes], edge_index=sub_edge_index, batch=sub_batch).to(device)
-        sub_data.num_nodes = topk_nodes.size(0)
-        return sub_data
-
-    def take_largest_cc(sub_data):
-        """在 sub_data 上取最大连通分量，返回 cc_data 以及 cc 内部索引 final_nodes"""
-        # sub_data 为空的兜底
-        if sub_data.num_nodes == 0:
-            final_nodes = torch.tensor([0], dtype=torch.long, device=device)
-            cc_edge_index, _ = subgraph(final_nodes, sub_data.edge_index, relabel_nodes=True)
-            cc_data = Data(x=sub_data.x[final_nodes], edge_index=cc_edge_index, batch=None).to(device)
-            cc_data.num_nodes = cc_data.x.size(0)
-            return cc_data, final_nodes
-
-        G_nx = to_networkx(sub_data, to_undirected=True)
-        ccs = list(nx.connected_components(G_nx))
-        if len(ccs) == 0:
-            largest_cc = {0}
-        else:
-            largest_cc = max(ccs, key=len)
-
-        final_nodes = torch.tensor(sorted(largest_cc), dtype=torch.long, device=device)
-        if final_nodes.numel() == 0:
-            final_nodes = torch.tensor([0], dtype=torch.long, device=device)
-
-        cc_edge_index, _ = subgraph(final_nodes, sub_data.edge_index, relabel_nodes=True)
-        cc_data = Data(x=sub_data.x[final_nodes], edge_index=cc_edge_index, batch=None).to(device)
-        cc_data.num_nodes = cc_data.x.size(0)
-        return cc_data, final_nodes
-
-    while True:
-        valid = []  # (k, conf_cc, cc_data, topk_nodes, final_nodes)
-
-        # 在[min_nodes, current_max]内扫描所有 k
-        for k in range(current_max, min_nodes - 1, -1):
-            topk_nodes = torch.tensor(sorted_nodes[:k], dtype=torch.long, device=device)
-            topk_sub = build_topk_sub(topk_nodes)
-
-            # ===== 改法2关键：先取 CC，再用 CC 算 conf =====
-            cc_data, final_nodes = take_largest_cc(topk_sub)
-
-            # cc_data 可能 < min_nodes，这里先照样算 conf（用于兜底）
-            cc_data.batch = torch.zeros(cc_data.num_nodes, dtype=torch.long, device=device)
-            _, cc_probs, _, _ = model(cc_data)
-            conf_cc = float(cc_probs[0, target_class].item())
-
-            if verbose_cc:
-                print(f"[k={k}] topk_nodes={k}, cc_nodes={cc_data.num_nodes}, conf_cc={conf_cc:.4f}")
-
-            # 全局最好兜底（在 CC 上比较）
-            if conf_cc > best_cc_conf:
-                best_cc_conf = conf_cc
-                best_cc_data = cc_data
-                best_cc_topk_nodes = topk_nodes
-                best_cc_final_nodes = final_nodes
-
-            # 只有“CC节点数也>=min_nodes 且 conf_cc 达标” 才算可行
-            if cc_data.num_nodes >= min_nodes and conf_cc >= threshold:
-                valid.append((k, conf_cc, cc_data, topk_nodes, final_nodes))
-
-        if valid:
-            # 选最小可行 k（valid 里 k 是降序扫的，所以最后一个最小）
-            k_min, conf_min, cc_min, topk_min, final_nodes_min = valid[-1]
-            best_cc_conf = conf_min
-            best_cc_data = cc_min
-            best_cc_topk_nodes = topk_min
-            best_cc_final_nodes = final_nodes_min
-            break
-
-        # 没可行解：放宽 max_nodes 或退出
-        if auto_expand and current_max < N:
-            current_max = min(N, current_max + expand_step)
-            expanded_times += 1
-            continue
-        else:
-            break
-
-    # ===== best_cc_data 此时就是“最终返回的连通子图” =====
-    connected_subgraph = Data(
-        x=best_cc_data.x.detach().cpu(),
-        edge_index=best_cc_data.edge_index.detach().cpu()
-    )
-    connected_subgraph.num_nodes = connected_subgraph.x.size(0)
-
-    if hasattr(graph, "y") and graph.y is not None:
-        connected_subgraph.y = graph.y.detach().cpu()
-
-    # orig_node_idx：topk_nodes 中对应 CC 节点的原图索引
-    connected_subgraph.orig_node_idx = best_cc_topk_nodes[best_cc_final_nodes].detach().cpu()
-
-    print(f"原始节点: {graph.num_nodes} → 子图节点: {connected_subgraph.num_nodes}")
-    print(f"原始置信度: {original_conf:.4f} → 子图置信度: {best_cc_conf:.4f} "
-          f"(保留 {best_cc_conf / (original_conf + 1e-12):.2%})")
-    if expanded_times > 0:
-        print(f"[AutoExpand] 放宽了 {expanded_times} 次 max_nodes，最终 max_nodes={current_max}")
-
-    if return_info:
-        info = dict(
-            original_nodes=g.num_nodes,
-            sub_nodes=connected_subgraph.num_nodes,
-            original_conf=original_conf,
-            sub_conf=best_cc_conf,
-            keep_ratio=best_cc_conf / (original_conf + 1e-12),
-            target_class=target_class,
-            min_nodes=min_nodes,
-            init_max_nodes=max_nodes,
-            final_max_nodes=current_max,
-            expanded_times=expanded_times
-        )
-        return connected_subgraph, info
-
-    return connected_subgraph
-
-
-
 def extract_connected_subgraph2(
         graph: Data,
-        model,  # 预训练的classifier
+        classiffier,  # 预训练的分类器
         target_class: int = None,
-        min_nodes: int = 6,
         max_nodes: int = 12,
         return_info: bool = False,
 ):
@@ -201,8 +18,8 @@ def extract_connected_subgraph2(
     2) 结构感知邻域扩展
     3) 子图质量快速筛选
     """
-    model.eval()
-    device = next(model.parameters()).device
+    classiffier.eval()
+    device = next(classiffier.parameters()).device
     g = graph.to(device)
 
     if not hasattr(g, "batch") or g.batch is None:
@@ -212,9 +29,9 @@ def extract_connected_subgraph2(
     # ===== 启用梯度计算 =====
     g.x.requires_grad = True
     # 确保模型参数的梯度追踪是启用的
-    for param in model.parameters():
+    for param in classiffier.parameters():
         param.requires_grad = True
-    logits, probs, node_emb, graph_emb = model(g)
+    logits, probs, node_emb, graph_emb = classiffier(g)
     if target_class is None:
         target_class = int(logits.argmax(dim=-1).item())
     original_conf = float(probs[0, target_class].item())
@@ -225,10 +42,6 @@ def extract_connected_subgraph2(
     loss = logits[0, target_class]
     loss.backward(retain_graph=True)
 
-    # if g.x.grad is None:
-    #     # 降级方案：如果无法获得梯度，使用嵌入范数
-    #     contribution = torch.norm(node_emb, dim=1)
-    # else:
     node_grad = torch.norm(g.x.grad, dim=1)
     contribution = node_grad * torch.norm(node_emb, dim=1)
 
@@ -331,7 +144,7 @@ def extract_connected_subgraph2(
 
     for sub_data, node_set in zip(candidate_subgraphs, candidate_node_sets):
         # 1) 计算子图置信度保留率
-        _, sub_probs, _, _ = model(sub_data)
+        _, sub_probs, _, _ = classiffier(sub_data)
         sub_conf = float(sub_probs[0, target_class].item())
         conf_retention = sub_conf / (original_conf + 1e-8)
 

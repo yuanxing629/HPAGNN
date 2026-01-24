@@ -1,0 +1,5 @@
+Configures.py
+/datasets/
+hyper_search.txt
+/log/
+/checkpoint/*/*/*.png

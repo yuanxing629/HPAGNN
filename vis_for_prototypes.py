@@ -223,7 +223,6 @@ def run_visualization():
             proto_graph_emb=target_vec,
             source_data=src_data,
             model=gnnNets.model,
-            min_nodes=model_args.min_nodes,
             max_nodes=model_args.max_nodes,
             iterations=50
         )
